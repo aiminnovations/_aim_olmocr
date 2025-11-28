@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: olmocr-config
+  namespace: olmocr
+data:
+  project_id: "YOUR_PROJECT_ID"
+  gcs_bucket: "olmocr-YOUR_PROJECT_ID"
+  pubsub_subscription: "olmocr-jobs-sub"
+  model_name: "allenai/olmOCR-2-7B-1025-FP8"

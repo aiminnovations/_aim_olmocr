@@ -1,0 +1,179 @@
+# Cloud Build configuration for olmOCR GCP deployment
+#
+# Usage:
+#   gcloud builds submit --config cloudbuild.yaml \
+#     --substitutions=_REGION=us-central1,_ZONE=us-central1-a
+#
+# Required substitutions:
+#   _REGION: GCP region for Cloud Run
+#   _ZONE: GCP zone for GKE cluster
+#
+# Optional substitutions:
+#   _API_URL: Backend API URL for frontend
+#   _FIREBASE_API_KEY: Firebase API key
+
+timeout: '3600s'  # 1 hour timeout for full build
+
+steps:
+  # ====== BUILD STAGE ======
+
+  # Build Frontend
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-frontend'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/olmocr-frontend:$SHORT_SHA'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/olmocr-frontend:latest'
+      - '--build-arg'
+      - 'VITE_API_URL=${_API_URL}'
+      - '--build-arg'
+      - 'VITE_FIREBASE_API_KEY=${_FIREBASE_API_KEY}'
+      - '--build-arg'
+      - 'VITE_FIREBASE_PROJECT_ID=$PROJECT_ID'
+      - '-f'
+      - 'gcp-frontend/Dockerfile'
+      - 'gcp-frontend'
+
+  # Build Backend API
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-backend'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/olmocr-api:$SHORT_SHA'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/olmocr-api:latest'
+      - '-f'
+      - 'gcp-backend/Dockerfile'
+      - 'gcp-backend'
+    waitFor: ['-']  # Run in parallel with frontend
+
+  # Build Worker (requires olmocr package)
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-worker'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/olmocr-worker:$SHORT_SHA'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/olmocr-worker:latest'
+      - '-f'
+      - 'gcp-worker/Dockerfile'
+      - '.'  # Context is repo root to include olmocr package
+    waitFor: ['-']  # Run in parallel
+
+  # ====== PUSH STAGE ======
+
+  # Push Frontend
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-frontend'
+    args:
+      - 'push'
+      - '--all-tags'
+      - 'gcr.io/$PROJECT_ID/olmocr-frontend'
+    waitFor: ['build-frontend']
+
+  # Push Backend
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-backend'
+    args:
+      - 'push'
+      - '--all-tags'
+      - 'gcr.io/$PROJECT_ID/olmocr-api'
+    waitFor: ['build-backend']
+
+  # Push Worker
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-worker'
+    args:
+      - 'push'
+      - '--all-tags'
+      - 'gcr.io/$PROJECT_ID/olmocr-worker'
+    waitFor: ['build-worker']
+
+  # ====== DEPLOY STAGE ======
+
+  # Deploy Frontend to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'deploy-frontend'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'olmocr-frontend'
+      - '--image=gcr.io/$PROJECT_ID/olmocr-frontend:$SHORT_SHA'
+      - '--region=${_REGION}'
+      - '--platform=managed'
+      - '--allow-unauthenticated'
+      - '--port=8080'
+      - '--cpu=1'
+      - '--memory=512Mi'
+      - '--min-instances=0'
+      - '--max-instances=10'
+    waitFor: ['push-frontend']
+
+  # Deploy Backend API to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'deploy-backend'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'olmocr-api'
+      - '--image=gcr.io/$PROJECT_ID/olmocr-api:$SHORT_SHA'
+      - '--region=${_REGION}'
+      - '--platform=managed'
+      - '--port=8080'
+      - '--cpu=2'
+      - '--memory=2Gi'
+      - '--min-instances=1'
+      - '--max-instances=20'
+      - '--service-account=olmocr-backend@$PROJECT_ID.iam.gserviceaccount.com'
+      - '--set-env-vars=GCP_PROJECT_ID=$PROJECT_ID,GCS_BUCKET=olmocr-$PROJECT_ID,ENVIRONMENT=production'
+    waitFor: ['push-backend']
+
+  # Deploy Worker to GKE (if cluster exists)
+  - name: 'gcr.io/cloud-builders/kubectl'
+    id: 'deploy-worker'
+    entrypoint: bash
+    args:
+      - '-c'
+      - |
+        # Check if cluster exists
+        if gcloud container clusters describe olmocr-cluster --zone=${_ZONE} --project=$PROJECT_ID 2>/dev/null; then
+          gcloud container clusters get-credentials olmocr-cluster --zone=${_ZONE} --project=$PROJECT_ID
+
+          # Update configmap with project ID
+          kubectl -n olmocr patch configmap olmocr-config \
+            --type=merge \
+            -p '{"data":{"project_id":"'$PROJECT_ID'","gcs_bucket":"olmocr-'$PROJECT_ID'"}}'
+
+          # Update deployment image
+          kubectl -n olmocr set image deployment/olmocr-worker \
+            worker=gcr.io/$PROJECT_ID/olmocr-worker:$SHORT_SHA
+
+          echo "Worker deployment updated"
+        else
+          echo "GKE cluster not found, skipping worker deployment"
+        fi
+    waitFor: ['push-worker']
+
+substitutions:
+  _REGION: us-central1
+  _ZONE: us-central1-a
+  _API_URL: ''
+  _FIREBASE_API_KEY: ''
+
+images:
+  - 'gcr.io/$PROJECT_ID/olmocr-frontend:$SHORT_SHA'
+  - 'gcr.io/$PROJECT_ID/olmocr-frontend:latest'
+  - 'gcr.io/$PROJECT_ID/olmocr-api:$SHORT_SHA'
+  - 'gcr.io/$PROJECT_ID/olmocr-api:latest'
+  - 'gcr.io/$PROJECT_ID/olmocr-worker:$SHORT_SHA'
+  - 'gcr.io/$PROJECT_ID/olmocr-worker:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_HIGHCPU_8'

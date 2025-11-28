@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: olmocr-worker
+  namespace: olmocr
+  labels:
+    app: olmocr-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: olmocr-worker
+  template:
+    metadata:
+      labels:
+        app: olmocr-worker
+    spec:
+      serviceAccountName: olmocr-worker
+      nodeSelector:
+        cloud.google.com/gke-accelerator: nvidia-tesla-t4
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "NoSchedule"
+      containers:
+      - name: worker
+        image: gcr.io/PROJECT_ID/olmocr-worker:latest
+        imagePullPolicy: Always
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+            memory: "32Gi"
+            cpu: "8"
+          requests:
+            nvidia.com/gpu: 1
+            memory: "16Gi"
+            cpu: "4"
+        env:
+        - name: GCP_PROJECT_ID
+          valueFrom:
+            configMapKeyRef:
+              name: olmocr-config
+              key: project_id
+        - name: GCS_BUCKET
+          valueFrom:
+            configMapKeyRef:
+              name: olmocr-config
+              key: gcs_bucket
+        - name: PUBSUB_SUBSCRIPTION
+          valueFrom:
+            configMapKeyRef:
+              name: olmocr-config
+              key: pubsub_subscription
+        - name: MODEL_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: olmocr-config
+              key: model_name
+        - name: VLLM_PORT
+          value: "30024"
+        volumeMounts:
+        - name: model-cache
+          mountPath: /root/.cache/huggingface
+      volumes:
+      - name: model-cache
+        persistentVolumeClaim:
+          claimName: model-cache-pvc
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: olmocr-worker
+  namespace: olmocr
+  annotations:
+    iam.gke.io/gcp-service-account: olmocr-worker@PROJECT_ID.iam.gserviceaccount.com

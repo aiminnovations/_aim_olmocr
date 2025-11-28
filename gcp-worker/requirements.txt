@@ -1,0 +1,15 @@
+# Core olmocr dependencies
+olmocr[gpu]
+
+# Google Cloud
+google-cloud-storage==2.14.0
+google-cloud-firestore==2.14.0
+google-cloud-pubsub==2.19.0
+
+# Additional deps
+aiohttp==3.9.1
+structlog==24.1.0
+python-dateutil==2.8.2
+
+# vLLM (included with olmocr[gpu])
+# vllm==0.11.0
