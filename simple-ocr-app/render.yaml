@@ -1,0 +1,16 @@
+# Render.com Blueprint - One-click deploy
+# Click "New" > "Blueprint" > Connect this repo
+
+services:
+  - type: web
+    name: olmocr-simple
+    env: docker
+    dockerfilePath: ./simple-ocr-app/Dockerfile
+    dockerContext: ./simple-ocr-app
+    plan: standard  # $25/mo, includes 2GB RAM
+    healthCheckPath: /health
+    envVars:
+      - key: PARASAIL_API_KEY
+        sync: false  # Will prompt for value during setup
+      - key: PORT
+        value: 8080

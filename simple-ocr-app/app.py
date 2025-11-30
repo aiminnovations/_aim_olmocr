@@ -244,6 +244,12 @@ async def delete_job(job_id: str):
     return {"status": "deleted"}
 
 
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for deployment platforms."""
+    return {"status": "healthy", "service": "olmocr-simple"}
+
+
 # ============================================
 # Frontend
 # ============================================
