@@ -233,14 +233,15 @@ class OlmOCRProcessor:
             "temperature": 0.1,
         }
 
-        # Send to vLLM
+        # Send to API (Parasail or local vLLM)
         async with self.session.post(
-            config.vllm_endpoint,
+            config.api_endpoint,
             json=query,
+            headers=config.api_headers,
         ) as response:
             if response.status != 200:
                 error_text = await response.text()
-                raise RuntimeError(f"vLLM request failed: {error_text}")
+                raise RuntimeError(f"API request failed ({response.status}): {error_text}")
 
             result = await response.json()
 
