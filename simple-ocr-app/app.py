@@ -162,10 +162,12 @@ async def delete_batch_doc(batch_id: str):
 async def list_batches() -> List[dict]:
     """List all batches."""
     fs = get_firestore()
-    docs = await fs.collection(BATCHES_COLLECTION).order_by(
-        'created_at', direction=firestore.Query.DESCENDING
-    ).get()
-    return [doc.to_dict() for doc in docs]
+    # Don't use order_by to avoid needing Firestore composite indexes
+    docs = await fs.collection(BATCHES_COLLECTION).get()
+    batches = [doc.to_dict() for doc in docs]
+    # Sort in Python instead
+    batches.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+    return batches
 
 
 async def save_job(job: dict):
@@ -204,10 +206,14 @@ async def delete_job_doc(job_id: str):
 async def get_batch_jobs(batch_id: str) -> List[dict]:
     """Get all jobs for a batch."""
     fs = get_firestore()
+    # Don't combine where + order_by to avoid needing Firestore composite indexes
     docs = await fs.collection(JOBS_COLLECTION).where(
         'batch_id', '==', batch_id
-    ).order_by('created_at').get()
-    return [doc.to_dict() for doc in docs]
+    ).get()
+    jobs = [doc.to_dict() for doc in docs]
+    # Sort in Python instead
+    jobs.sort(key=lambda x: x.get('created_at', ''))
+    return jobs
 
 
 async def save_page(job_id: str, page_num: int, page_data: dict):
@@ -221,10 +227,14 @@ async def save_page(job_id: str, page_num: int, page_data: dict):
 async def get_pages(job_id: str) -> List[dict]:
     """Get all pages for a job."""
     fs = get_firestore()
+    # Don't combine where + order_by to avoid needing Firestore composite indexes
     docs = await fs.collection(PAGES_COLLECTION).where(
         'job_id', '==', job_id
-    ).order_by('page_num').get()
-    return [doc.to_dict() for doc in docs]
+    ).get()
+    pages = [doc.to_dict() for doc in docs]
+    # Sort in Python instead
+    pages.sort(key=lambda x: x.get('page_num', 0))
+    return pages
 
 
 # ============================================
