@@ -1,0 +1,19 @@
+# Development Dockerfile for olmOCR Frontend
+# Supports hot module replacement (HMR)
+
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Install dependencies
+COPY package*.json ./
+RUN npm install
+
+# Copy source (volumes will override in dev)
+COPY . .
+
+# Expose Vite dev server port
+EXPOSE 5173
+
+# Start development server with HMR
+CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]

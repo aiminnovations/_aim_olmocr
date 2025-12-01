@@ -1,0 +1,146 @@
+# olmOCR Local Development Docker Compose
+# Usage: docker-compose up -d
+#
+# This sets up the full olmOCR stack locally for development.
+# Note: GPU worker requires nvidia-docker for local GPU processing.
+
+version: '3.8'
+
+services:
+  # Frontend - React application
+  frontend:
+    build:
+      context: ./gcp-frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    environment:
+      - VITE_API_URL=http://localhost:8000/api
+    depends_on:
+      - backend
+    networks:
+      - olmocr-network
+
+  # Backend - FastAPI application
+  backend:
+    build:
+      context: ./gcp-backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8000
+      - DEBUG=true
+      - LOG_LEVEL=DEBUG
+      - GCP_PROJECT_ID=${GCP_PROJECT_ID:-local-dev}
+      - GCS_BUCKET=${GCS_BUCKET:-olmocr-local}
+      - PUBSUB_TOPIC=olmocr-jobs
+      - PUBSUB_SUBSCRIPTION=olmocr-jobs-sub
+      - CORS_ORIGINS=http://localhost:3000,http://localhost:5173
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials.json
+    volumes:
+      - ./gcp-backend:/app
+      - ${GOOGLE_APPLICATION_CREDENTIALS:-./credentials.json}:/app/credentials.json:ro
+      - local-storage:/data/storage
+    depends_on:
+      - pubsub-emulator
+      - firestore-emulator
+    networks:
+      - olmocr-network
+
+  # Worker - GPU processing (requires nvidia-docker)
+  worker:
+    build:
+      context: ./gcp-worker
+      dockerfile: Dockerfile
+    environment:
+      - GCP_PROJECT_ID=${GCP_PROJECT_ID:-local-dev}
+      - GCS_BUCKET=${GCS_BUCKET:-olmocr-local}
+      - PUBSUB_SUBSCRIPTION=olmocr-jobs-sub
+      - MODEL_NAME=allenai/olmOCR-2-7B-1025-FP8
+      - MODEL_CACHE_DIR=/models
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials.json
+      - PUBSUB_EMULATOR_HOST=pubsub-emulator:8085
+      - FIRESTORE_EMULATOR_HOST=firestore-emulator:8080
+    volumes:
+      - ${GOOGLE_APPLICATION_CREDENTIALS:-./credentials.json}:/app/credentials.json:ro
+      - model-cache:/models
+      - local-storage:/data/storage
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    depends_on:
+      - pubsub-emulator
+      - firestore-emulator
+    networks:
+      - olmocr-network
+    profiles:
+      - gpu  # Only start with: docker-compose --profile gpu up
+
+  # GCP Pub/Sub Emulator for local development
+  pubsub-emulator:
+    image: gcr.io/google.com/cloudsdktool/cloud-sdk:latest
+    command: >
+      bash -c "
+        gcloud beta emulators pubsub start --host-port=0.0.0.0:8085 &
+        sleep 5 &&
+        curl -X PUT 'http://localhost:8085/v1/projects/local-dev/topics/olmocr-jobs' &&
+        curl -X PUT 'http://localhost:8085/v1/projects/local-dev/subscriptions/olmocr-jobs-sub' \
+          -H 'Content-Type: application/json' \
+          -d '{\"topic\":\"projects/local-dev/topics/olmocr-jobs\"}' &&
+        wait
+      "
+    ports:
+      - "8085:8085"
+    networks:
+      - olmocr-network
+
+  # GCP Firestore Emulator for local development
+  firestore-emulator:
+    image: gcr.io/google.com/cloudsdktool/cloud-sdk:latest
+    command: >
+      gcloud emulators firestore start --host-port=0.0.0.0:8080
+    ports:
+      - "8080:8080"
+    networks:
+      - olmocr-network
+
+  # Optional: Local GCS emulator (fake-gcs-server)
+  gcs-emulator:
+    image: fsouza/fake-gcs-server:latest
+    command: -scheme http -backend memory -public-host localhost:4443
+    ports:
+      - "4443:4443"
+    volumes:
+      - gcs-data:/data
+    networks:
+      - olmocr-network
+    profiles:
+      - emulators
+
+  # Optional: Redis for caching
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - olmocr-network
+    profiles:
+      - cache
+
+networks:
+  olmocr-network:
+    driver: bridge
+
+volumes:
+  local-storage:
+  model-cache:
+  gcs-data:
+  redis-data:

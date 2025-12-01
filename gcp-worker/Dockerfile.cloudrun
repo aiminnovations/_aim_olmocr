@@ -1,0 +1,45 @@
+# Worker Dockerfile for Cloud Run (Parasail API mode - no GPU required)
+# This is a lightweight image for serverless deployment using Parasail API
+
+FROM python:3.11-slim
+
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Install system dependencies (PDF rendering)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    poppler-utils \
+    fonts-liberation \
+    fonts-dejavu \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements and install (without vLLM for API mode)
+COPY gcp-worker/requirements.cloudrun.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy olmocr package
+COPY olmocr/ ./olmocr/
+
+# Copy worker code
+COPY gcp-worker/worker/ ./worker/
+
+# Set Python path
+ENV PYTHONPATH=/app
+
+# Default to Parasail API mode
+ENV PROCESSING_MODE="parasail"
+ENV GCP_PROJECT_ID=""
+ENV GCS_BUCKET=""
+ENV PUBSUB_SUBSCRIPTION="olmocr-jobs-sub"
+ENV PARASAIL_API_KEY=""
+ENV PARASAIL_MODEL="allenai/olmOCR-2-7B-1025"
+
+# Expose port for Cloud Run
+EXPOSE 8080
+
+# Run the HTTP handler for Cloud Run (receives Pub/Sub push messages)
+CMD ["python", "-m", "worker.http_handler"]

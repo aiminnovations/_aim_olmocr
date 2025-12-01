@@ -1,0 +1,12 @@
+# olmOCR Terraform Variables
+# Copy this file to terraform.tfvars and fill in your values
+
+# Required: Your GCP Project ID
+project_id = "juniper-core"
+
+# Optional: GCP Region (default: us-central1)
+region = "us-central1"
+
+# Required: Parasail API Key for olmOCR model access
+# Get your key from https://parasail.io
+parasail_api_key = "psk-your-api-key-here"

@@ -2,12 +2,12 @@
 Main worker entry point.
 
 Pulls messages from Pub/Sub and processes PDFs using olmOCR.
+Supports both Parasail API mode (serverless) and local GPU mode.
 """
 
 import asyncio
 import json
 import logging
-import os
 import signal
 import subprocess
 import sys
@@ -16,7 +16,7 @@ from typing import Optional
 
 from google.cloud import pubsub_v1
 
-from .config import config
+from .config import config, ProcessingMode
 from .processor import OlmOCRProcessor
 
 # Configure logging
@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 class VLLMServer:
-    """Manager for local vLLM server process."""
+    """Manager for local vLLM server process (GPU mode only)."""
 
     def __init__(self, model_name: str, port: int):
         self.model_name = model_name
@@ -115,11 +115,17 @@ class Worker:
     async def start(self) -> None:
         """Start the worker."""
         logger.info(f"Starting worker {config.worker_id}")
+        logger.info(f"Processing mode: {config.processing_mode.value}")
         logger.info(f"Subscription: {self.subscription_path}")
 
-        # Start vLLM server
-        self.vllm_server = VLLMServer(config.model_name, config.vllm_port)
-        self.vllm_server.start()
+        # Start vLLM server only in GPU mode
+        if config.processing_mode == ProcessingMode.LOCAL_GPU:
+            logger.info("GPU mode: Starting local vLLM server")
+            self.vllm_server = VLLMServer(config.local_model_name, config.vllm_port)
+            self.vllm_server.start()
+        else:
+            logger.info(f"Parasail API mode: Using {config.parasail_api_url}")
+            logger.info(f"Model: {config.parasail_model}")
 
         # Initialize processor
         self.processor = OlmOCRProcessor()
@@ -199,6 +205,20 @@ class Worker:
 
 def main():
     """Main entry point."""
+    # Log configuration
+    logger.info("=" * 60)
+    logger.info("olmOCR Worker Starting")
+    logger.info("=" * 60)
+    logger.info(f"GCP Project: {config.gcp_project_id}")
+    logger.info(f"GCS Bucket: {config.gcs_bucket}")
+    logger.info(f"Processing Mode: {config.processing_mode.value}")
+    if config.is_parasail_mode:
+        logger.info(f"Parasail Model: {config.parasail_model}")
+        logger.info(f"Parasail API: {config.parasail_api_url}")
+    else:
+        logger.info(f"Local Model: {config.local_model_name}")
+    logger.info("=" * 60)
+
     worker = Worker()
     asyncio.run(worker.start())
 

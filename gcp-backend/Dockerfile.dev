@@ -1,0 +1,28 @@
+# Development Dockerfile for olmOCR Backend
+# Supports hot reload with uvicorn
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir watchfiles
+
+# Copy source (volumes will override in dev)
+COPY . .
+
+# Create storage directory
+RUN mkdir -p /data/storage
+
+# Expose port
+EXPOSE 8000
+
+# Start with hot reload
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
