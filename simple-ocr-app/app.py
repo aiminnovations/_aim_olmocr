@@ -67,6 +67,9 @@ PAGES_COLLECTION = "ocr_pages"
 db: Optional[firestore.AsyncClient] = None
 gcs_client: Optional[storage.Client] = None
 
+# In-memory PDF storage fallback (for local dev when no GCS)
+pdf_memory_store: Dict[str, bytes] = {}
+
 
 def get_firestore() -> firestore.AsyncClient:
     """Get Firestore async client."""
@@ -253,12 +256,9 @@ async def store_pdf(job_id: str, pdf_bytes: bytes):
             )
         )
     else:
-        # Fallback: store in Firestore (for small PDFs < 1MB)
-        # Note: Firestore has 1MB document limit
-        fs = get_firestore()
-        await fs.collection('pdf_storage').document(job_id).set({
-            'data': base64.b64encode(pdf_bytes).decode('utf-8')
-        })
+        # Fallback: store in memory (no size limit, but not persistent across restarts)
+        # This is fine for local development
+        pdf_memory_store[job_id] = pdf_bytes
 
 
 async def load_pdf(job_id: str) -> Optional[bytes]:
@@ -272,14 +272,8 @@ async def load_pdf(job_id: str) -> Optional[bytes]:
         except Exception:
             return None
     else:
-        # Fallback: load from Firestore
-        fs = get_firestore()
-        doc = await fs.collection('pdf_storage').document(job_id).get()
-        if doc.exists:
-            data = doc.to_dict().get('data')
-            if data:
-                return base64.b64decode(data)
-    return None
+        # Fallback: load from memory
+        return pdf_memory_store.get(job_id)
 
 
 async def delete_pdf(job_id: str):
@@ -293,9 +287,8 @@ async def delete_pdf(job_id: str):
         except Exception:
             pass
     else:
-        # Fallback: delete from Firestore
-        fs = get_firestore()
-        await fs.collection('pdf_storage').document(job_id).delete()
+        # Fallback: delete from memory
+        pdf_memory_store.pop(job_id, None)
 
 
 async def save_output(job_id: str, output_text: str):
@@ -690,7 +683,11 @@ async def upload_multiple(
         except json.JSONDecodeError:
             rel_paths = []
 
-    pdf_files = [f for f in files if f.filename.lower().endswith('.pdf')]
+    # Filter PDF files - check filename safely
+    pdf_files = []
+    for f in files:
+        if f.filename and f.filename.lower().endswith('.pdf'):
+            pdf_files.append(f)
 
     if not pdf_files:
         raise HTTPException(400, "No PDF files provided")
@@ -709,37 +706,67 @@ async def upload_multiple(
     await save_batch(batch)
 
     job_ids = []
+    errors = []
 
     for i, file in enumerate(pdf_files):
-        pdf_bytes = await file.read()
-        job_id = f"job_{uuid.uuid4().hex[:12]}"
+        try:
+            # Read file content
+            pdf_bytes = await file.read()
 
-        rel_path = rel_paths[i] if i < len(rel_paths) else None
+            if not pdf_bytes:
+                errors.append(f"{file.filename}: Empty file")
+                continue
 
-        await store_pdf(job_id, pdf_bytes)
+            job_id = f"job_{uuid.uuid4().hex[:12]}"
+            rel_path = rel_paths[i] if i < len(rel_paths) else None
 
-        job = {
-            "id": job_id,
-            "batch_id": batch_id,
-            "filename": file.filename,
-            "relative_path": rel_path,
-            "status": "queued",
-            "progress": 0,
-            "total_pages": 0,
-            "current_page": 0,
-            "created_at": datetime.now().isoformat(),
-            "started_at": None,
-            "completed_at": None,
-            "error": None,
-            "total_input_tokens": 0,
-            "total_output_tokens": 0
-        }
-        await save_job(job)
+            # Store PDF
+            try:
+                await store_pdf(job_id, pdf_bytes)
+            except Exception as e:
+                errors.append(f"{file.filename}: Storage failed - {str(e)}")
+                continue
 
-        job_ids.append(job_id)
-        start_job_processing(job_id)
+            job = {
+                "id": job_id,
+                "batch_id": batch_id,
+                "filename": file.filename,
+                "relative_path": rel_path,
+                "status": "queued",
+                "progress": 0,
+                "total_pages": 0,
+                "current_page": 0,
+                "created_at": datetime.now().isoformat(),
+                "started_at": None,
+                "completed_at": None,
+                "error": None,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+            }
+            await save_job(job)
 
-    return {"batch_id": batch_id, "job_ids": job_ids}
+            job_ids.append(job_id)
+            start_job_processing(job_id)
+
+        except Exception as e:
+            errors.append(f"{file.filename}: {str(e)}")
+            continue
+
+    # Update batch total if some files failed
+    if len(job_ids) < len(pdf_files):
+        batch['total_files'] = len(job_ids)
+        if len(job_ids) == 0:
+            batch['status'] = 'failed'
+        await save_batch(batch)
+
+    if not job_ids:
+        raise HTTPException(400, f"All uploads failed: {'; '.join(errors)}")
+
+    return {
+        "batch_id": batch_id,
+        "job_ids": job_ids,
+        "errors": errors if errors else None
+    }
 
 
 @app.patch("/api/batch/{batch_id}")
@@ -1341,6 +1368,11 @@ HTML_TEMPLATE = """
                 const data = await response.json();
 
                 if (response.ok) {
+                    // Show any partial errors
+                    if (data.errors && data.errors.length > 0) {
+                        console.warn('Some uploads had issues:', data.errors);
+                        alert('Some files had issues:\\n' + data.errors.join('\\n'));
+                    }
                     pollBatch(data.batch_id);
                     clearStaged();
                     document.getElementById('batchName').value = '';
