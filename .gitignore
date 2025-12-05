@@ -91,3 +91,7 @@ __pycache__
 
 docs/build
 site/
+
+# App data (generated at runtime)
+simple-ocr-app/data/
+simple-ocr-app/.env

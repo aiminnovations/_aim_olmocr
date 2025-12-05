@@ -39,6 +39,10 @@ from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()  # Loads from .env in current directory or parent directories
+
 import aiohttp
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse
