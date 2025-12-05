@@ -1,7 +1,13 @@
 # ml stuff
 wandb/
 *histogram.png
+
+# Ignore all JSON except specific config files
 *.json
+!package.json
+!package-lock.json
+!tsconfig.json
+!tsconfig.node.json
 dolma_previews/*
 s2_previews/*
 gnarly_previews/*
