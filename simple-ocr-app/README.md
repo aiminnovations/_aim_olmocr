@@ -10,6 +10,55 @@ A high-performance web app for batch PDF-to-Markdown conversion using olmOCR via
 - **Batch Organization** - Group files into batches with separate output configurations
 - **Configurable Output** - Choose where processed files are saved
 - **No Document Limits** - Process as many PDFs as you want
+- **Web-Based Configuration** - Configure API keys through the browser (no console needed)
+- **Mobile Friendly** - Works on any device with a modern browser
+
+---
+
+## Remote Deployment (Recommended)
+
+Deploy and manage the app entirely from your browser - no terminal required!
+
+### One-Time GitHub Setup
+
+1. **Fork or clone this repository** to your GitHub account
+
+2. **Add GitHub Secrets** (in your repo's Settings → Secrets → Actions):
+
+   | Secret | Required | Description |
+   |--------|----------|-------------|
+   | `GCP_PROJECT_ID` | Yes | Your Google Cloud project ID |
+   | `GCP_SA_KEY` | Yes | Service account JSON key (see below) |
+   | `PARASAIL_API_KEY` | No | Optional - can configure via web UI instead |
+
+3. **Create a GCP Service Account** (one-time setup in Google Cloud Console):
+   - Go to [IAM & Admin → Service Accounts](https://console.cloud.google.com/iam-admin/serviceaccounts)
+   - Create a new service account with these roles:
+     - Cloud Run Admin
+     - Cloud Build Editor
+     - Storage Admin
+     - Cloud Datastore User
+   - Create a JSON key and paste the entire contents into the `GCP_SA_KEY` secret
+
+4. **Deploy**: Push any change to `simple-ocr-app/` or manually trigger the workflow
+
+### First-Time App Setup
+
+After deployment:
+
+1. Open the app URL (shown in GitHub Actions output)
+2. A setup wizard will appear asking for your Parasail API key
+3. Enter your key and click "Save & Continue"
+4. Start uploading PDFs!
+
+### Updating the API Key
+
+1. Click the **Settings** button (gear icon) in the app header
+2. Enter a new API key
+3. Click "Test Connection" to verify
+4. Click "Save Changes"
+
+No redeployment needed - changes take effect immediately.
 
 ---
 
@@ -123,7 +172,7 @@ Open http://localhost:8080
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `PARASAIL_API_KEY` | Yes | - | Your Parasail API key for olmOCR |
+| `PARASAIL_API_KEY` | No* | - | Your Parasail API key for olmOCR |
 | `GCP_PROJECT_ID` | Yes | - | Google Cloud project ID |
 | `GCS_BUCKET` | No | - | GCS bucket for PDF storage (falls back to Firestore) |
 | `PORT` | No | `8080` | Server port |
@@ -131,6 +180,8 @@ Open http://localhost:8080
 | `MAX_CONCURRENT_JOBS` | No | `3` | Max jobs processed simultaneously |
 | `RENDER_DPI` | No | `120` | DPI for PDF rendering |
 | `IMAGE_QUALITY` | No | `85` | JPEG quality (1-100) |
+
+\* API key can be configured via the web UI instead of environment variable
 
 ---
 

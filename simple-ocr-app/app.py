@@ -59,6 +59,8 @@ GCS_BUCKET = os.environ.get("GCS_BUCKET", "")  # For PDF storage
 BATCHES_COLLECTION = "ocr_batches"
 JOBS_COLLECTION = "ocr_jobs"
 PAGES_COLLECTION = "ocr_pages"
+SETTINGS_COLLECTION = "ocr_settings"
+SETTINGS_DOC_ID = "app_config"
 
 # ============================================
 # Firestore Client
@@ -88,6 +90,82 @@ def get_gcs_client() -> Optional[storage.Client]:
     if gcs_client is None and GCS_BUCKET:
         gcs_client = storage.Client()
     return gcs_client
+
+
+# ============================================
+# Settings Management (Web-configurable)
+# ============================================
+
+# Cache for settings to avoid repeated Firestore reads
+_settings_cache: Dict[str, any] = {}
+_settings_cache_time: Optional[datetime] = None
+SETTINGS_CACHE_TTL = 300  # 5 minutes
+
+
+async def get_settings() -> Dict:
+    """Get application settings from Firestore."""
+    global _settings_cache, _settings_cache_time
+
+    # Check cache
+    if _settings_cache and _settings_cache_time:
+        age = (datetime.now() - _settings_cache_time).total_seconds()
+        if age < SETTINGS_CACHE_TTL:
+            return _settings_cache
+
+    try:
+        fs = get_firestore()
+        doc = await fs.collection(SETTINGS_COLLECTION).document(SETTINGS_DOC_ID).get()
+        if doc.exists:
+            _settings_cache = doc.to_dict()
+            _settings_cache_time = datetime.now()
+            return _settings_cache
+    except Exception as e:
+        print(f"Error reading settings: {e}")
+
+    return {}
+
+
+async def save_settings(settings: Dict) -> bool:
+    """Save application settings to Firestore."""
+    global _settings_cache, _settings_cache_time
+
+    try:
+        fs = get_firestore()
+        settings['updated_at'] = datetime.now().isoformat()
+        await fs.collection(SETTINGS_COLLECTION).document(SETTINGS_DOC_ID).set(settings, merge=True)
+
+        # Update cache
+        _settings_cache = {**_settings_cache, **settings}
+        _settings_cache_time = datetime.now()
+        return True
+    except Exception as e:
+        print(f"Error saving settings: {e}")
+        return False
+
+
+async def get_api_key() -> str:
+    """Get Parasail API key - checks Firestore first, falls back to env var."""
+    settings = await get_settings()
+    api_key = settings.get('parasail_api_key', '')
+
+    # Fall back to environment variable if not in Firestore
+    if not api_key:
+        api_key = PARASAIL_API_KEY
+
+    return api_key
+
+
+async def is_configured() -> bool:
+    """Check if the app has been configured with an API key."""
+    api_key = await get_api_key()
+    return bool(api_key and len(api_key) > 10)
+
+
+def clear_settings_cache():
+    """Clear the settings cache to force a refresh."""
+    global _settings_cache, _settings_cache_time
+    _settings_cache = {}
+    _settings_cache_time = None
 
 
 # ============================================
@@ -355,7 +433,8 @@ async def process_single_page(
     session: aiohttp.ClientSession,
     image_base64: str,
     page_num: int,
-    semaphore: asyncio.Semaphore
+    semaphore: asyncio.Semaphore,
+    api_key: str
 ) -> dict:
     """Process a single page via Parasail API with rate limiting."""
 
@@ -381,7 +460,7 @@ async def process_single_page(
         }
 
         headers = {
-            "Authorization": f"Bearer {PARASAIL_API_KEY}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
 
@@ -448,6 +527,11 @@ async def process_job(job_id: str):
             if not job:
                 return
 
+            # Get API key dynamically from settings
+            api_key = await get_api_key()
+            if not api_key:
+                raise Exception("No API key configured. Please set up your Parasail API key in Settings.")
+
             job['status'] = 'processing'
             job['started_at'] = datetime.now().isoformat()
             await save_job(job)
@@ -479,7 +563,7 @@ async def process_job(job_id: str):
 
             async with aiohttp.ClientSession() as session:
                 tasks = [
-                    process_single_page(session, img_b64, page_num, page_semaphore)
+                    process_single_page(session, img_b64, page_num, page_semaphore, api_key)
                     for page_num, img_b64 in enumerate(base64_images)
                 ]
 
@@ -585,6 +669,103 @@ def start_job_processing(job_id: str):
 # ============================================
 # API Endpoints
 # ============================================
+
+@app.get("/api/settings")
+async def get_settings_endpoint():
+    """Get current application settings (masks sensitive data)."""
+    settings = await get_settings()
+    api_key = settings.get('parasail_api_key', '')
+
+    # Mask API key for display (show last 4 chars only)
+    masked_key = ''
+    if api_key:
+        masked_key = '*' * (len(api_key) - 4) + api_key[-4:] if len(api_key) > 4 else '****'
+
+    return {
+        "configured": await is_configured(),
+        "parasail_api_key_masked": masked_key,
+        "has_api_key": bool(api_key),
+        "updated_at": settings.get('updated_at'),
+        # Include env var status for transparency
+        "env_var_set": bool(PARASAIL_API_KEY)
+    }
+
+
+@app.post("/api/settings")
+async def save_settings_endpoint(
+    parasail_api_key: str = Form(None)
+):
+    """Save application settings."""
+    if not parasail_api_key:
+        raise HTTPException(400, "API key is required")
+
+    # Basic validation
+    if len(parasail_api_key) < 10:
+        raise HTTPException(400, "API key appears to be invalid (too short)")
+
+    # Save to Firestore
+    success = await save_settings({
+        'parasail_api_key': parasail_api_key
+    })
+
+    if not success:
+        raise HTTPException(500, "Failed to save settings")
+
+    return {"status": "saved", "message": "API key saved successfully"}
+
+
+@app.post("/api/settings/test")
+async def test_api_key():
+    """Test the configured API key by making a simple API call."""
+    api_key = await get_api_key()
+
+    if not api_key:
+        raise HTTPException(400, "No API key configured")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Make a minimal test request
+            payload = {
+                "model": PARASAIL_MODEL,
+                "messages": [{"role": "user", "content": "test"}],
+                "max_tokens": 1
+            }
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
+
+            async with session.post(
+                PARASAIL_API_URL,
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as response:
+                if response.status == 200:
+                    return {"status": "success", "message": "API key is valid"}
+                elif response.status == 401:
+                    return {"status": "error", "message": "Invalid API key (unauthorized)"}
+                else:
+                    error = await response.text()
+                    return {"status": "error", "message": f"API error: {error[:100]}"}
+
+    except asyncio.TimeoutError:
+        return {"status": "error", "message": "Connection timed out"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)[:100]}
+
+
+@app.get("/api/status")
+async def get_status():
+    """Get overall app status including configuration state."""
+    configured = await is_configured()
+
+    return {
+        "configured": configured,
+        "ready": configured,
+        "message": "Ready to process PDFs" if configured else "Please configure your API key in Settings"
+    }
+
 
 @app.post("/api/batch")
 async def create_batch_endpoint(
@@ -935,18 +1116,141 @@ HTML_TEMPLATE = """
     </style>
 </head>
 <body class="bg-gray-100 min-h-screen">
-    <div class="container mx-auto px-4 py-8 max-w-6xl">
-        <div class="text-center mb-8">
-            <h1 class="text-4xl font-bold text-gray-800 mb-2">
-                olmOCR Batch Processor
-            </h1>
-            <p class="text-gray-600">
-                High-performance PDF to Markdown - Upload files or folders
-            </p>
-            <p class="text-sm text-green-600 mt-2">
-                Jobs persist even if you close this page
-            </p>
+    <!-- Setup Wizard Modal (shows when not configured) -->
+    <div id="setupModal" class="hidden fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center p-4">
+        <div class="bg-white rounded-2xl shadow-2xl max-w-md w-full p-8">
+            <div class="text-center mb-6">
+                <div class="w-16 h-16 bg-blue-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                    <svg class="w-8 h-8 text-blue-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                              d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/>
+                    </svg>
+                </div>
+                <h2 class="text-2xl font-bold text-gray-800 mb-2">Welcome to olmOCR!</h2>
+                <p class="text-gray-600">
+                    To get started, enter your Parasail API key below.
+                </p>
+            </div>
+
+            <div class="mb-4">
+                <label class="block text-sm font-medium text-gray-700 mb-2">
+                    Parasail API Key
+                </label>
+                <input type="password" id="setupApiKey"
+                       placeholder="psk-..."
+                       class="w-full px-4 py-3 border border-gray-300 rounded-lg
+                              focus:ring-2 focus:ring-blue-500 focus:border-transparent">
+                <p class="text-xs text-gray-500 mt-2">
+                    Get your API key at <a href="https://parasail.io" target="_blank"
+                                           class="text-blue-600 hover:underline">parasail.io</a>
+                </p>
+            </div>
+
+            <div id="setupError" class="hidden mb-4 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
+            </div>
+
+            <div id="setupSuccess" class="hidden mb-4 p-3 bg-green-50 border border-green-200 rounded-lg text-green-700 text-sm">
+            </div>
+
+            <div class="flex gap-3">
+                <button onclick="testSetupKey()"
+                        class="flex-1 px-4 py-3 bg-gray-100 text-gray-700 rounded-lg
+                               hover:bg-gray-200 font-medium transition">
+                    Test Key
+                </button>
+                <button onclick="saveSetupKey()" id="setupSaveBtn"
+                        class="flex-1 px-4 py-3 bg-blue-500 text-white rounded-lg
+                               hover:bg-blue-600 font-medium transition">
+                    Save & Continue
+                </button>
+            </div>
         </div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div id="settingsModal" class="hidden fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center p-4">
+        <div class="bg-white rounded-2xl shadow-2xl max-w-md w-full p-8">
+            <div class="flex justify-between items-center mb-6">
+                <h2 class="text-xl font-bold text-gray-800">Settings</h2>
+                <button onclick="closeSettings()" class="text-gray-400 hover:text-gray-600">
+                    <svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                    </svg>
+                </button>
+            </div>
+
+            <div class="mb-4">
+                <label class="block text-sm font-medium text-gray-700 mb-2">
+                    Parasail API Key
+                </label>
+                <div class="flex gap-2">
+                    <input type="password" id="settingsApiKey"
+                           placeholder="Enter new API key or leave blank to keep current"
+                           class="flex-1 px-4 py-2 border border-gray-300 rounded-lg
+                                  focus:ring-2 focus:ring-blue-500 focus:border-transparent">
+                    <button onclick="toggleKeyVisibility('settingsApiKey')"
+                            class="px-3 py-2 bg-gray-100 rounded-lg hover:bg-gray-200">
+                        <svg class="w-5 h-5 text-gray-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/>
+                        </svg>
+                    </button>
+                </div>
+                <p id="currentKeyInfo" class="text-xs text-gray-500 mt-2"></p>
+            </div>
+
+            <div id="settingsError" class="hidden mb-4 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
+            </div>
+
+            <div id="settingsSuccess" class="hidden mb-4 p-3 bg-green-50 border border-green-200 rounded-lg text-green-700 text-sm">
+            </div>
+
+            <div class="flex gap-3">
+                <button onclick="testSettingsKey()"
+                        class="flex-1 px-4 py-2 bg-gray-100 text-gray-700 rounded-lg
+                               hover:bg-gray-200 font-medium transition">
+                    Test Connection
+                </button>
+                <button onclick="saveSettingsKey()"
+                        class="flex-1 px-4 py-2 bg-blue-500 text-white rounded-lg
+                               hover:bg-blue-600 font-medium transition">
+                    Save Changes
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <div class="container mx-auto px-4 py-8 max-w-6xl">
+        <!-- Header with Settings Button -->
+        <div class="flex justify-between items-start mb-8">
+            <div class="text-center flex-1">
+                <h1 class="text-4xl font-bold text-gray-800 mb-2">
+                    olmOCR Batch Processor
+                </h1>
+                <p class="text-gray-600">
+                    High-performance PDF to Markdown - Upload files or folders
+                </p>
+                <p class="text-sm text-green-600 mt-2" id="statusMessage">
+                    Jobs persist even if you close this page
+                </p>
+            </div>
+            <button onclick="openSettings()"
+                    class="flex items-center gap-2 px-4 py-2 bg-gray-100 text-gray-700
+                           rounded-lg hover:bg-gray-200 transition">
+                <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                          d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/>
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                          d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+                </svg>
+                <span class="hidden sm:inline">Settings</span>
+            </button>
+        </div>
+
+        <!-- Main Content (disabled when not configured) -->
+        <div id="mainContent">
 
         <div class="bg-white rounded-xl shadow-lg p-6 mb-8">
             <div class="flex border-b border-gray-200 mb-6">
@@ -1097,6 +1401,7 @@ HTML_TEMPLATE = """
                 </div>
             </div>
         </div>
+        </div> <!-- End mainContent -->
     </div>
 
     <script>
@@ -1106,6 +1411,246 @@ HTML_TEMPLATE = """
         let stagedFiles = [];
         let activeBatches = {};
         let pollIntervals = {};
+        let isConfigured = false;
+
+        // ============================================
+        // Settings & Setup Functions
+        // ============================================
+
+        async function checkConfiguration() {
+            try {
+                const response = await fetch('/api/status');
+                const data = await response.json();
+                isConfigured = data.configured;
+
+                if (!isConfigured) {
+                    showSetupWizard();
+                    document.getElementById('mainContent').style.opacity = '0.5';
+                    document.getElementById('mainContent').style.pointerEvents = 'none';
+                } else {
+                    hideSetupWizard();
+                    document.getElementById('mainContent').style.opacity = '1';
+                    document.getElementById('mainContent').style.pointerEvents = 'auto';
+                    document.getElementById('statusMessage').textContent = 'Ready - Jobs persist even if you close this page';
+                    document.getElementById('statusMessage').classList.remove('text-yellow-600');
+                    document.getElementById('statusMessage').classList.add('text-green-600');
+                }
+            } catch (error) {
+                console.error('Failed to check configuration:', error);
+            }
+        }
+
+        function showSetupWizard() {
+            document.getElementById('setupModal').classList.remove('hidden');
+        }
+
+        function hideSetupWizard() {
+            document.getElementById('setupModal').classList.add('hidden');
+        }
+
+        function openSettings() {
+            loadCurrentSettings();
+            document.getElementById('settingsModal').classList.remove('hidden');
+        }
+
+        function closeSettings() {
+            document.getElementById('settingsModal').classList.add('hidden');
+            document.getElementById('settingsError').classList.add('hidden');
+            document.getElementById('settingsSuccess').classList.add('hidden');
+            document.getElementById('settingsApiKey').value = '';
+        }
+
+        async function loadCurrentSettings() {
+            try {
+                const response = await fetch('/api/settings');
+                const data = await response.json();
+
+                if (data.has_api_key) {
+                    document.getElementById('currentKeyInfo').textContent =
+                        `Current key: ${data.parasail_api_key_masked}`;
+                } else if (data.env_var_set) {
+                    document.getElementById('currentKeyInfo').textContent =
+                        'Using API key from environment variable';
+                } else {
+                    document.getElementById('currentKeyInfo').textContent =
+                        'No API key configured';
+                }
+            } catch (error) {
+                console.error('Failed to load settings:', error);
+            }
+        }
+
+        function toggleKeyVisibility(inputId) {
+            const input = document.getElementById(inputId);
+            input.type = input.type === 'password' ? 'text' : 'password';
+        }
+
+        async function testSetupKey() {
+            const apiKey = document.getElementById('setupApiKey').value.trim();
+            if (!apiKey) {
+                showSetupError('Please enter an API key');
+                return;
+            }
+
+            // First save, then test
+            const formData = new FormData();
+            formData.append('parasail_api_key', apiKey);
+
+            try {
+                const saveResponse = await fetch('/api/settings', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!saveResponse.ok) {
+                    const error = await saveResponse.json();
+                    showSetupError(error.detail || 'Failed to save key');
+                    return;
+                }
+
+                // Now test it
+                const testResponse = await fetch('/api/settings/test', { method: 'POST' });
+                const testData = await testResponse.json();
+
+                if (testData.status === 'success') {
+                    showSetupSuccess('API key is valid!');
+                } else {
+                    showSetupError(testData.message);
+                }
+            } catch (error) {
+                showSetupError('Connection failed: ' + error.message);
+            }
+        }
+
+        async function saveSetupKey() {
+            const apiKey = document.getElementById('setupApiKey').value.trim();
+            if (!apiKey) {
+                showSetupError('Please enter an API key');
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('parasail_api_key', apiKey);
+
+            try {
+                const response = await fetch('/api/settings', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (response.ok) {
+                    showSetupSuccess('API key saved! Redirecting...');
+                    setTimeout(() => {
+                        hideSetupWizard();
+                        checkConfiguration();
+                    }, 1000);
+                } else {
+                    const error = await response.json();
+                    showSetupError(error.detail || 'Failed to save');
+                }
+            } catch (error) {
+                showSetupError('Failed to save: ' + error.message);
+            }
+        }
+
+        async function testSettingsKey() {
+            const apiKey = document.getElementById('settingsApiKey').value.trim();
+
+            // If a new key is provided, save it first
+            if (apiKey) {
+                const formData = new FormData();
+                formData.append('parasail_api_key', apiKey);
+
+                try {
+                    const saveResponse = await fetch('/api/settings', {
+                        method: 'POST',
+                        body: formData
+                    });
+
+                    if (!saveResponse.ok) {
+                        const error = await saveResponse.json();
+                        showSettingsError(error.detail || 'Failed to save key');
+                        return;
+                    }
+                } catch (error) {
+                    showSettingsError('Failed to save: ' + error.message);
+                    return;
+                }
+            }
+
+            // Test the current key
+            try {
+                const response = await fetch('/api/settings/test', { method: 'POST' });
+                const data = await response.json();
+
+                if (data.status === 'success') {
+                    showSettingsSuccess('Connection successful! API key is valid.');
+                } else {
+                    showSettingsError(data.message);
+                }
+            } catch (error) {
+                showSettingsError('Test failed: ' + error.message);
+            }
+        }
+
+        async function saveSettingsKey() {
+            const apiKey = document.getElementById('settingsApiKey').value.trim();
+
+            if (!apiKey) {
+                showSettingsError('Please enter a new API key');
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('parasail_api_key', apiKey);
+
+            try {
+                const response = await fetch('/api/settings', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (response.ok) {
+                    showSettingsSuccess('API key saved successfully!');
+                    loadCurrentSettings();
+                    document.getElementById('settingsApiKey').value = '';
+                    checkConfiguration();
+                } else {
+                    const error = await response.json();
+                    showSettingsError(error.detail || 'Failed to save');
+                }
+            } catch (error) {
+                showSettingsError('Failed to save: ' + error.message);
+            }
+        }
+
+        function showSetupError(message) {
+            const el = document.getElementById('setupError');
+            el.textContent = message;
+            el.classList.remove('hidden');
+            document.getElementById('setupSuccess').classList.add('hidden');
+        }
+
+        function showSetupSuccess(message) {
+            const el = document.getElementById('setupSuccess');
+            el.textContent = message;
+            el.classList.remove('hidden');
+            document.getElementById('setupError').classList.add('hidden');
+        }
+
+        function showSettingsError(message) {
+            const el = document.getElementById('settingsError');
+            el.textContent = message;
+            el.classList.remove('hidden');
+            document.getElementById('settingsSuccess').classList.add('hidden');
+        }
+
+        function showSettingsSuccess(message) {
+            const el = document.getElementById('settingsSuccess');
+            el.textContent = message;
+            el.classList.remove('hidden');
+            document.getElementById('settingsError').classList.add('hidden');
+        }
 
         function setUploadMode(mode) {
             uploadMode = mode;
@@ -1741,7 +2286,11 @@ HTML_TEMPLATE = """
         }
 
         // Initialize
-        loadExistingBatches();
+        async function init() {
+            await checkConfiguration();
+            loadExistingBatches();
+        }
+        init();
     </script>
 </body>
 </html>
