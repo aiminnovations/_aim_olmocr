@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 """
-olmOCR Batch Processor v2.0
+olmOCR Batch Processor v3.0
 
-A high-performance web app for batch processing PDFs using olmOCR via Parasail API.
-Features:
-- Parallel page processing (5-10x faster)
-- Persistent jobs via Google Cloud Firestore (survive page refresh/close)
+A simple, high-performance web app for batch processing PDFs using olmOCR.
+
+FEATURES:
+- Works locally without any cloud services (SQLite storage)
+- Optional cloud mode with Google Cloud Firestore/Storage
+- Parallel page processing (5-10x faster than sequential)
+- Persistent jobs (survive page refresh/browser close)
 - Folder uploads with structure preservation
-- Configurable output locations
-- Batch grouping for organized processing
+- Beautiful responsive web UI
 
-Usage:
+QUICK START (Local Mode - No Cloud Required):
     pip install -r requirements.txt
+    export PARASAIL_API_KEY="your-key"   # Get from https://parasail.io
     python app.py
 
 Then open http://localhost:8080 in your browser.
+
+STORAGE MODES:
+- Local (default): Uses SQLite + filesystem - no cloud services needed
+- Cloud: Uses Google Cloud Firestore + GCS (set GCP_PROJECT_ID)
 """
 
 import asyncio
@@ -22,17 +29,25 @@ import base64
 import io
 import json
 import os
+import sqlite3
 import uuid
-from typing import List, Optional, Dict
+import shutil
+from pathlib import Path
+from typing import List, Optional, Dict, Any
 from datetime import datetime
 from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
+import threading
+
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()  # Loads from .env in current directory or parent directories
 
 import aiohttp
-from google.cloud import firestore
-from google.cloud import storage
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 import uvicorn
 from pdf2image import convert_from_bytes
 from PIL import Image
@@ -41,9 +56,10 @@ from PIL import Image
 # Configuration
 # ============================================
 
+# Parasail API Configuration
 PARASAIL_API_KEY = os.environ.get("PARASAIL_API_KEY", "")
-PARASAIL_API_URL = "https://api.parasail.io/v1/chat/completions"
-PARASAIL_MODEL = "allenai/olmOCR-2-7B-1025"
+PARASAIL_API_URL = os.environ.get("PARASAIL_API_URL", "https://api.parasail.io/v1/chat/completions")
+PARASAIL_MODEL = os.environ.get("PARASAIL_MODEL", "allenai/olmOCR-2-7B-1025")
 
 # Performance settings
 MAX_CONCURRENT_PAGES = int(os.environ.get("MAX_CONCURRENT_PAGES", "5"))
@@ -51,9 +67,10 @@ MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "3"))
 RENDER_DPI = int(os.environ.get("RENDER_DPI", "120"))
 IMAGE_QUALITY = int(os.environ.get("IMAGE_QUALITY", "85"))
 
-# GCP Configuration
+# Storage mode: "local" (SQLite + filesystem) or "cloud" (Firestore + GCS)
+STORAGE_MODE = os.environ.get("STORAGE_MODE", "local")
 GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "")
-GCS_BUCKET = os.environ.get("GCS_BUCKET", "")  # For PDF storage
+GCS_BUCKET = os.environ.get("GCS_BUCKET", "")
 
 # Firestore collection names
 BATCHES_COLLECTION = "ocr_batches"
@@ -61,36 +78,36 @@ JOBS_COLLECTION = "ocr_jobs"
 PAGES_COLLECTION = "ocr_pages"
 SETTINGS_COLLECTION = "ocr_settings"
 SETTINGS_DOC_ID = "app_config"
+# Local storage paths
+DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
+DB_PATH = DATA_DIR / "olmocr.db"
+PDF_DIR = DATA_DIR / "pdfs"
+OUTPUT_DIR = DATA_DIR / "outputs"
 
 # ============================================
-# Firestore Client
+# Storage Backend Interface
 # ============================================
 
-db: Optional[firestore.AsyncClient] = None
-gcs_client: Optional[storage.Client] = None
+class StorageBackend:
+    """Abstract storage backend interface."""
 
-# In-memory PDF storage fallback (for local dev when no GCS)
-pdf_memory_store: Dict[str, bytes] = {}
+    async def init(self):
+        raise NotImplementedError
 
+    async def save_batch(self, batch: dict):
+        raise NotImplementedError
 
-def get_firestore() -> firestore.AsyncClient:
-    """Get Firestore async client."""
-    global db
-    if db is None:
-        if GCP_PROJECT_ID:
-            db = firestore.AsyncClient(project=GCP_PROJECT_ID)
-        else:
-            db = firestore.AsyncClient()
-    return db
+    async def get_batch(self, batch_id: str) -> Optional[dict]:
+        raise NotImplementedError
 
+    async def delete_batch(self, batch_id: str):
+        raise NotImplementedError
 
-def get_gcs_client() -> Optional[storage.Client]:
-    """Get GCS client for PDF storage."""
-    global gcs_client
-    if gcs_client is None and GCS_BUCKET:
-        gcs_client = storage.Client()
-    return gcs_client
+    async def list_batches(self) -> List[dict]:
+        raise NotImplementedError
 
+    async def save_job(self, job: dict):
+        raise NotImplementedError
 
 # ============================================
 # Settings Management (Web-configurable)
@@ -171,40 +188,362 @@ def clear_settings_cache():
 # ============================================
 # App Setup
 # ============================================
+    async def get_job(self, job_id: str) -> Optional[dict]:
+        raise NotImplementedError
 
-# Global state for active processing
+    async def delete_job(self, job_id: str):
+        raise NotImplementedError
+
+    async def get_batch_jobs(self, batch_id: str) -> List[dict]:
+        raise NotImplementedError
+
+    async def get_pending_jobs(self) -> List[dict]:
+        raise NotImplementedError
+
+    async def save_output(self, job_id: str, text: str):
+        raise NotImplementedError
+
+    async def get_output(self, job_id: str) -> Optional[str]:
+        raise NotImplementedError
+
+    async def store_pdf(self, job_id: str, pdf_bytes: bytes):
+        raise NotImplementedError
+
+    async def load_pdf(self, job_id: str) -> Optional[bytes]:
+        raise NotImplementedError
+
+    async def delete_pdf(self, job_id: str):
+        raise NotImplementedError
+
+
+# ============================================
+# SQLite Local Storage Backend
+# ============================================
+
+class SQLiteBackend(StorageBackend):
+    """Local storage using SQLite and filesystem."""
+
+    def __init__(self):
+        self._local = threading.local()
+        self._executor = ThreadPoolExecutor(max_workers=4)
+
+    def _get_conn(self) -> sqlite3.Connection:
+        if not hasattr(self._local, 'conn') or self._local.conn is None:
+            self._local.conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+            self._local.conn.row_factory = sqlite3.Row
+        return self._local.conn
+
+    async def init(self):
+        """Initialize database and directories."""
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        PDF_DIR.mkdir(parents=True, exist_ok=True)
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+        conn = self._get_conn()
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS batches (
+                id TEXT PRIMARY KEY,
+                data TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS jobs (
+                id TEXT PRIMARY KEY,
+                batch_id TEXT NOT NULL,
+                data TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (batch_id) REFERENCES batches(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS outputs (
+                job_id TEXT PRIMARY KEY,
+                text TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_jobs_batch ON jobs(batch_id);
+            CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(json_extract(data, '$.status'));
+        """)
+        conn.commit()
+        print(f"SQLite database initialized at {DB_PATH}")
+
+    async def save_batch(self, batch: dict):
+        def _save():
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT OR REPLACE INTO batches (id, data, created_at) VALUES (?, ?, ?)",
+                (batch['id'], json.dumps(batch), batch.get('created_at', datetime.now().isoformat()))
+            )
+            conn.commit()
+        await asyncio.get_event_loop().run_in_executor(self._executor, _save)
+
+    async def get_batch(self, batch_id: str) -> Optional[dict]:
+        def _get():
+            conn = self._get_conn()
+            row = conn.execute("SELECT data FROM batches WHERE id = ?", (batch_id,)).fetchone()
+            return json.loads(row['data']) if row else None
+        return await asyncio.get_event_loop().run_in_executor(self._executor, _get)
+
+    async def delete_batch(self, batch_id: str):
+        def _delete():
+            conn = self._get_conn()
+            conn.execute("DELETE FROM batches WHERE id = ?", (batch_id,))
+            conn.commit()
+        await asyncio.get_event_loop().run_in_executor(self._executor, _delete)
+
+    async def list_batches(self) -> List[dict]:
+        def _list():
+            conn = self._get_conn()
+            rows = conn.execute("SELECT data FROM batches ORDER BY created_at DESC").fetchall()
+            return [json.loads(row['data']) for row in rows]
+        return await asyncio.get_event_loop().run_in_executor(self._executor, _list)
+
+    async def save_job(self, job: dict):
+        def _save():
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT OR REPLACE INTO jobs (id, batch_id, data, created_at) VALUES (?, ?, ?, ?)",
+                (job['id'], job['batch_id'], json.dumps(job), job.get('created_at', datetime.now().isoformat()))
+            )
+            conn.commit()
+        await asyncio.get_event_loop().run_in_executor(self._executor, _save)
+
+    async def get_job(self, job_id: str) -> Optional[dict]:
+        def _get():
+            conn = self._get_conn()
+            row = conn.execute("SELECT data FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            return json.loads(row['data']) if row else None
+        return await asyncio.get_event_loop().run_in_executor(self._executor, _get)
+
+    async def delete_job(self, job_id: str):
+        def _delete():
+            conn = self._get_conn()
+            conn.execute("DELETE FROM outputs WHERE job_id = ?", (job_id,))
+            conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+            conn.commit()
+        await asyncio.get_event_loop().run_in_executor(self._executor, _delete)
+        await self.delete_pdf(job_id)
+
+    async def get_batch_jobs(self, batch_id: str) -> List[dict]:
+        def _get():
+            conn = self._get_conn()
+            rows = conn.execute(
+                "SELECT data FROM jobs WHERE batch_id = ? ORDER BY created_at",
+                (batch_id,)
+            ).fetchall()
+            return [json.loads(row['data']) for row in rows]
+        return await asyncio.get_event_loop().run_in_executor(self._executor, _get)
+
+    async def get_pending_jobs(self) -> List[dict]:
+        def _get():
+            conn = self._get_conn()
+            rows = conn.execute("""
+                SELECT data FROM jobs
+                WHERE json_extract(data, '$.status') IN ('queued', 'pending', 'processing')
+            """).fetchall()
+            return [json.loads(row['data']) for row in rows]
+        return await asyncio.get_event_loop().run_in_executor(self._executor, _get)
+
+    async def save_output(self, job_id: str, text: str):
+        def _save():
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT OR REPLACE INTO outputs (job_id, text, created_at) VALUES (?, ?, ?)",
+                (job_id, text, datetime.now().isoformat())
+            )
+            conn.commit()
+        await asyncio.get_event_loop().run_in_executor(self._executor, _save)
+
+        # Also save to file for easy access
+        output_file = OUTPUT_DIR / f"{job_id}.md"
+        output_file.write_text(text, encoding='utf-8')
+
+    async def get_output(self, job_id: str) -> Optional[str]:
+        def _get():
+            conn = self._get_conn()
+            row = conn.execute("SELECT text FROM outputs WHERE job_id = ?", (job_id,)).fetchone()
+            return row['text'] if row else None
+        return await asyncio.get_event_loop().run_in_executor(self._executor, _get)
+
+    async def store_pdf(self, job_id: str, pdf_bytes: bytes):
+        def _store():
+            pdf_path = PDF_DIR / f"{job_id}.pdf"
+            pdf_path.write_bytes(pdf_bytes)
+        await asyncio.get_event_loop().run_in_executor(self._executor, _store)
+
+    async def load_pdf(self, job_id: str) -> Optional[bytes]:
+        def _load():
+            pdf_path = PDF_DIR / f"{job_id}.pdf"
+            if pdf_path.exists():
+                return pdf_path.read_bytes()
+            return None
+        return await asyncio.get_event_loop().run_in_executor(self._executor, _load)
+
+    async def delete_pdf(self, job_id: str):
+        def _delete():
+            pdf_path = PDF_DIR / f"{job_id}.pdf"
+            if pdf_path.exists():
+                pdf_path.unlink()
+        await asyncio.get_event_loop().run_in_executor(self._executor, _delete)
+
+
+# ============================================
+# Firestore Cloud Storage Backend
+# ============================================
+
+class FirestoreBackend(StorageBackend):
+    """Cloud storage using Google Cloud Firestore and GCS."""
+
+    def __init__(self):
+        self.db = None
+        self.gcs_client = None
+        self._memory_store: Dict[str, bytes] = {}  # Fallback if no GCS
+
+    async def init(self):
+        from google.cloud import firestore
+        from google.cloud import storage
+
+        if GCP_PROJECT_ID:
+            self.db = firestore.AsyncClient(project=GCP_PROJECT_ID)
+        else:
+            self.db = firestore.AsyncClient()
+
+        if GCS_BUCKET:
+            self.gcs_client = storage.Client()
+
+        # Test connection
+        await self.db.collection('_health').limit(1).get()
+        print(f"Connected to Firestore (project: {GCP_PROJECT_ID or 'auto-detect'})")
+
+    async def save_batch(self, batch: dict):
+        await self.db.collection('ocr_batches').document(batch['id']).set(batch)
+
+    async def get_batch(self, batch_id: str) -> Optional[dict]:
+        doc = await self.db.collection('ocr_batches').document(batch_id).get()
+        return doc.to_dict() if doc.exists else None
+
+    async def delete_batch(self, batch_id: str):
+        await self.db.collection('ocr_batches').document(batch_id).delete()
+
+    async def list_batches(self) -> List[dict]:
+        docs = await self.db.collection('ocr_batches').get()
+        batches = [doc.to_dict() for doc in docs]
+        batches.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+        return batches
+
+    async def save_job(self, job: dict):
+        await self.db.collection('ocr_jobs').document(job['id']).set(job)
+
+    async def get_job(self, job_id: str) -> Optional[dict]:
+        doc = await self.db.collection('ocr_jobs').document(job_id).get()
+        return doc.to_dict() if doc.exists else None
+
+    async def delete_job(self, job_id: str):
+        await self.db.collection('ocr_jobs').document(job_id).delete()
+        await self.delete_pdf(job_id)
+
+    async def get_batch_jobs(self, batch_id: str) -> List[dict]:
+        docs = await self.db.collection('ocr_jobs').where('batch_id', '==', batch_id).get()
+        jobs = [doc.to_dict() for doc in docs]
+        jobs.sort(key=lambda x: x.get('created_at', ''))
+        return jobs
+
+    async def get_pending_jobs(self) -> List[dict]:
+        docs = await self.db.collection('ocr_jobs').where(
+            'status', 'in', ['queued', 'pending', 'processing']
+        ).get()
+        return [doc.to_dict() for doc in docs]
+
+    async def save_output(self, job_id: str, text: str):
+        await self.db.collection('ocr_outputs').document(job_id).set({
+            'text': text,
+            'created_at': datetime.now().isoformat()
+        })
+
+    async def get_output(self, job_id: str) -> Optional[str]:
+        doc = await self.db.collection('ocr_outputs').document(job_id).get()
+        return doc.to_dict().get('text') if doc.exists else None
+
+    async def store_pdf(self, job_id: str, pdf_bytes: bytes):
+        if self.gcs_client and GCS_BUCKET:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: self.gcs_client.bucket(GCS_BUCKET).blob(f"pdfs/{job_id}.pdf").upload_from_string(
+                    pdf_bytes, content_type='application/pdf'
+                )
+            )
+        else:
+            self._memory_store[job_id] = pdf_bytes
+
+    async def load_pdf(self, job_id: str) -> Optional[bytes]:
+        if self.gcs_client and GCS_BUCKET:
+            loop = asyncio.get_event_loop()
+            try:
+                blob = self.gcs_client.bucket(GCS_BUCKET).blob(f"pdfs/{job_id}.pdf")
+                return await loop.run_in_executor(None, blob.download_as_bytes)
+            except Exception:
+                return None
+        else:
+            return self._memory_store.get(job_id)
+
+    async def delete_pdf(self, job_id: str):
+        if self.gcs_client and GCS_BUCKET:
+            loop = asyncio.get_event_loop()
+            try:
+                blob = self.gcs_client.bucket(GCS_BUCKET).blob(f"pdfs/{job_id}.pdf")
+                await loop.run_in_executor(None, blob.delete)
+            except Exception:
+                pass
+        else:
+            self._memory_store.pop(job_id, None)
+
+
+# ============================================
+# Global State
+# ============================================
+
+storage: StorageBackend = None
 active_tasks: Dict[str, asyncio.Task] = {}
 job_semaphore: Optional[asyncio.Semaphore] = None
 
 
+# ============================================
+# App Setup
+# ============================================
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage app lifecycle."""
-    global job_semaphore
+    global storage, job_semaphore
 
-    # Startup
+    # Initialize storage backend
+    if STORAGE_MODE == "cloud" or GCP_PROJECT_ID:
+        print("Using Cloud storage mode (Firestore + GCS)")
+        storage = FirestoreBackend()
+    else:
+        print("Using Local storage mode (SQLite + filesystem)")
+        storage = SQLiteBackend()
+
+    await storage.init()
     job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
-    # Test Firestore connection
-    try:
-        fs = get_firestore()
-        # Simple test query
-        await fs.collection(BATCHES_COLLECTION).limit(1).get()
-        print("Connected to Firestore successfully")
-    except Exception as e:
-        print(f"Warning: Firestore connection issue: {e}")
-
-    # Resume any interrupted jobs
+    # Resume pending jobs
     asyncio.create_task(resume_pending_jobs())
 
     yield
 
-    # Shutdown - cancel active tasks
+    # Shutdown
     for task in active_tasks.values():
         task.cancel()
 
 
-app = FastAPI(title="olmOCR Batch Processor", version="2.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="olmOCR Batch Processor",
+    version="3.0.0",
+    description="High-performance PDF to Markdown conversion",
+    lifespan=lifespan
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -216,179 +555,7 @@ app.add_middleware(
 
 
 # ============================================
-# Firestore Data Operations
-# ============================================
-
-async def save_batch(batch: dict):
-    """Save batch to Firestore."""
-    fs = get_firestore()
-    await fs.collection(BATCHES_COLLECTION).document(batch['id']).set(batch)
-
-
-async def get_batch(batch_id: str) -> Optional[dict]:
-    """Get batch from Firestore."""
-    fs = get_firestore()
-    doc = await fs.collection(BATCHES_COLLECTION).document(batch_id).get()
-    if doc.exists:
-        return doc.to_dict()
-    return None
-
-
-async def delete_batch_doc(batch_id: str):
-    """Delete batch from Firestore."""
-    fs = get_firestore()
-    await fs.collection(BATCHES_COLLECTION).document(batch_id).delete()
-
-
-async def list_batches() -> List[dict]:
-    """List all batches."""
-    fs = get_firestore()
-    # Don't use order_by to avoid needing Firestore composite indexes
-    docs = await fs.collection(BATCHES_COLLECTION).get()
-    batches = [doc.to_dict() for doc in docs]
-    # Sort in Python instead
-    batches.sort(key=lambda x: x.get('created_at', ''), reverse=True)
-    return batches
-
-
-async def save_job(job: dict):
-    """Save job to Firestore."""
-    fs = get_firestore()
-    await fs.collection(JOBS_COLLECTION).document(job['id']).set(job)
-
-
-async def get_job(job_id: str) -> Optional[dict]:
-    """Get job from Firestore."""
-    fs = get_firestore()
-    doc = await fs.collection(JOBS_COLLECTION).document(job_id).get()
-    if doc.exists:
-        return doc.to_dict()
-    return None
-
-
-async def delete_job_doc(job_id: str):
-    """Delete job and its pages from Firestore."""
-    fs = get_firestore()
-
-    # Delete pages
-    pages = await fs.collection(PAGES_COLLECTION).where(
-        'job_id', '==', job_id
-    ).get()
-    for page_doc in pages:
-        await page_doc.reference.delete()
-
-    # Delete job
-    await fs.collection(JOBS_COLLECTION).document(job_id).delete()
-
-    # Delete PDF from GCS if exists
-    await delete_pdf(job_id)
-
-
-async def get_batch_jobs(batch_id: str) -> List[dict]:
-    """Get all jobs for a batch."""
-    fs = get_firestore()
-    # Don't combine where + order_by to avoid needing Firestore composite indexes
-    docs = await fs.collection(JOBS_COLLECTION).where(
-        'batch_id', '==', batch_id
-    ).get()
-    jobs = [doc.to_dict() for doc in docs]
-    # Sort in Python instead
-    jobs.sort(key=lambda x: x.get('created_at', ''))
-    return jobs
-
-
-async def save_page(job_id: str, page_num: int, page_data: dict):
-    """Save page result to Firestore."""
-    fs = get_firestore()
-    page_id = f"{job_id}_page_{page_num}"
-    page_data['job_id'] = job_id
-    await fs.collection(PAGES_COLLECTION).document(page_id).set(page_data)
-
-
-async def get_pages(job_id: str) -> List[dict]:
-    """Get all pages for a job."""
-    fs = get_firestore()
-    # Don't combine where + order_by to avoid needing Firestore composite indexes
-    docs = await fs.collection(PAGES_COLLECTION).where(
-        'job_id', '==', job_id
-    ).get()
-    pages = [doc.to_dict() for doc in docs]
-    # Sort in Python instead
-    pages.sort(key=lambda x: x.get('page_num', 0))
-    return pages
-
-
-# ============================================
-# PDF Storage (Google Cloud Storage)
-# ============================================
-
-async def store_pdf(job_id: str, pdf_bytes: bytes):
-    """Store PDF bytes in GCS or memory."""
-    client = get_gcs_client()
-    if client and GCS_BUCKET:
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: client.bucket(GCS_BUCKET).blob(f"pdfs/{job_id}.pdf").upload_from_string(
-                pdf_bytes, content_type='application/pdf'
-            )
-        )
-    else:
-        # Fallback: store in memory (no size limit, but not persistent across restarts)
-        # This is fine for local development
-        pdf_memory_store[job_id] = pdf_bytes
-
-
-async def load_pdf(job_id: str) -> Optional[bytes]:
-    """Load PDF bytes from GCS or memory."""
-    client = get_gcs_client()
-    if client and GCS_BUCKET:
-        loop = asyncio.get_event_loop()
-        try:
-            blob = client.bucket(GCS_BUCKET).blob(f"pdfs/{job_id}.pdf")
-            return await loop.run_in_executor(None, blob.download_as_bytes)
-        except Exception:
-            return None
-    else:
-        # Fallback: load from memory
-        return pdf_memory_store.get(job_id)
-
-
-async def delete_pdf(job_id: str):
-    """Delete stored PDF."""
-    client = get_gcs_client()
-    if client and GCS_BUCKET:
-        loop = asyncio.get_event_loop()
-        try:
-            blob = client.bucket(GCS_BUCKET).blob(f"pdfs/{job_id}.pdf")
-            await loop.run_in_executor(None, blob.delete)
-        except Exception:
-            pass
-    else:
-        # Fallback: delete from memory
-        pdf_memory_store.pop(job_id, None)
-
-
-async def save_output(job_id: str, output_text: str):
-    """Save job output to Firestore."""
-    fs = get_firestore()
-    await fs.collection('outputs').document(job_id).set({
-        'text': output_text,
-        'created_at': datetime.now().isoformat()
-    })
-
-
-async def get_output(job_id: str) -> Optional[str]:
-    """Get job output from Firestore."""
-    fs = get_firestore()
-    doc = await fs.collection('outputs').document(job_id).get()
-    if doc.exists:
-        return doc.to_dict().get('text')
-    return None
-
-
-# ============================================
-# olmOCR Processing (Optimized)
+# OCR Processing Functions
 # ============================================
 
 def get_ocr_prompt():
@@ -403,7 +570,7 @@ def get_ocr_prompt():
 
 
 def render_all_pages(pdf_bytes: bytes, dpi: int = RENDER_DPI) -> List[Image.Image]:
-    """Render all PDF pages at once (much faster than one-by-one)."""
+    """Render all PDF pages at once."""
     images = convert_from_bytes(pdf_bytes, dpi=dpi)
 
     processed = []
@@ -420,7 +587,7 @@ def render_all_pages(pdf_bytes: bytes, dpi: int = RENDER_DPI) -> List[Image.Imag
 
 
 def image_to_base64(img: Image.Image, quality: int = IMAGE_QUALITY) -> str:
-    """Convert image to base64 JPEG (smaller than PNG)."""
+    """Convert image to base64 JPEG."""
     if img.mode in ('RGBA', 'P'):
         img = img.convert('RGB')
 
@@ -436,7 +603,7 @@ async def process_single_page(
     semaphore: asyncio.Semaphore,
     api_key: str
 ) -> dict:
-    """Process a single page via Parasail API with rate limiting."""
+    """Process a single page via Parasail API."""
 
     async with semaphore:
         payload = {
@@ -504,16 +671,6 @@ async def process_single_page(
             }
 
 
-async def update_job_progress(job_id: str, current_page: int, total_pages: int):
-    """Update job progress in Firestore."""
-    job = await get_job(job_id)
-    if job:
-        progress = int((current_page / total_pages) * 100) if total_pages > 0 else 0
-        job['current_page'] = current_page
-        job['progress'] = progress
-        await save_job(job)
-
-
 async def process_job(job_id: str):
     """Process a single job with parallel page processing."""
     global job_semaphore
@@ -523,7 +680,7 @@ async def process_job(job_id: str):
 
     async with job_semaphore:
         try:
-            job = await get_job(job_id)
+            job = await storage.get_job(job_id)
             if not job:
                 return
 
@@ -534,30 +691,29 @@ async def process_job(job_id: str):
 
             job['status'] = 'processing'
             job['started_at'] = datetime.now().isoformat()
-            await save_job(job)
+            await storage.save_job(job)
 
-            pdf_bytes = await load_pdf(job_id)
+            # Load PDF
+            pdf_bytes = await storage.load_pdf(job_id)
             if not pdf_bytes:
                 raise Exception("PDF file not found")
 
+            # Render pages
             loop = asyncio.get_event_loop()
             images = await loop.run_in_executor(None, render_all_pages, pdf_bytes)
             num_pages = len(images)
 
             job['total_pages'] = num_pages
-            await save_job(job)
+            await storage.save_job(job)
 
+            # Convert to base64
             def convert_images(imgs):
                 return [image_to_base64(img) for img in imgs]
 
-            base64_images = await loop.run_in_executor(
-                None,
-                convert_images,
-                images
-            )
+            base64_images = await loop.run_in_executor(None, convert_images, images)
+            del images  # Free memory
 
-            del images
-
+            # Process pages in parallel
             page_semaphore = asyncio.Semaphore(MAX_CONCURRENT_PAGES)
             completed_pages = 0
 
@@ -573,11 +729,18 @@ async def process_job(job_id: str):
                     results.append(result)
                     completed_pages += 1
 
-                    await save_page(job_id, result['page_num'], result)
-                    await update_job_progress(job_id, completed_pages, num_pages)
+                    # Update progress
+                    job = await storage.get_job(job_id)
+                    if job:
+                        progress = int((completed_pages / num_pages) * 100)
+                        job['current_page'] = completed_pages
+                        job['progress'] = progress
+                        await storage.save_job(job)
 
+            # Sort results by page number
             results.sort(key=lambda x: x["page_num"])
 
+            # Combine results
             full_text = "\n\n---\n\n".join(
                 f"## Page {r['page_num']}\n\n{r['text']}" if not r.get('error')
                 else f"## Page {r['page_num']}\n\n[Error: {r['error']}]"
@@ -587,33 +750,36 @@ async def process_job(job_id: str):
             total_input = sum(r.get("input_tokens", 0) for r in results)
             total_output = sum(r.get("output_tokens", 0) for r in results)
 
-            await save_output(job_id, full_text)
+            # Save output
+            await storage.save_output(job_id, full_text)
 
-            job = await get_job(job_id)
+            # Update job status
+            job = await storage.get_job(job_id)
             if job:
                 job['status'] = 'completed'
                 job['progress'] = 100
                 job['completed_at'] = datetime.now().isoformat()
                 job['total_input_tokens'] = total_input
                 job['total_output_tokens'] = total_output
-                await save_job(job)
+                await storage.save_job(job)
                 await update_batch_progress(job['batch_id'])
 
-            await delete_pdf(job_id)
+            # Clean up PDF
+            await storage.delete_pdf(job_id)
 
         except asyncio.CancelledError:
-            job = await get_job(job_id)
+            job = await storage.get_job(job_id)
             if job:
                 job['status'] = 'pending'
-                await save_job(job)
+                await storage.save_job(job)
             raise
 
         except Exception as e:
-            job = await get_job(job_id)
+            job = await storage.get_job(job_id)
             if job:
                 job['status'] = 'failed'
                 job['error'] = str(e)
-                await save_job(job)
+                await storage.save_job(job)
                 await update_batch_progress(job['batch_id'])
 
 
@@ -622,18 +788,18 @@ async def update_batch_progress(batch_id: str):
     if not batch_id:
         return
 
-    batch = await get_batch(batch_id)
+    batch = await storage.get_batch(batch_id)
     if not batch:
         return
 
-    jobs = await get_batch_jobs(batch_id)
+    jobs = await storage.get_batch_jobs(batch_id)
     completed = sum(1 for j in jobs if j['status'] in ('completed', 'failed'))
 
     batch['completed_files'] = completed
     if completed >= batch['total_files']:
         batch['status'] = 'completed'
 
-    await save_batch(batch)
+    await storage.save_batch(batch)
 
 
 async def resume_pending_jobs():
@@ -641,16 +807,14 @@ async def resume_pending_jobs():
     await asyncio.sleep(1)
 
     try:
-        fs = get_firestore()
-        docs = await fs.collection(JOBS_COLLECTION).where(
-            'status', 'in', ['queued', 'pending', 'processing']
-        ).get()
-
-        for doc in docs:
-            job = doc.to_dict()
+        pending_jobs = await storage.get_pending_jobs()
+        for job in pending_jobs:
             job_id = job['id']
             if job_id not in active_tasks:
                 start_job_processing(job_id)
+
+        if pending_jobs:
+            print(f"Resumed {len(pending_jobs)} pending jobs")
     except Exception as e:
         print(f"Error resuming jobs: {e}")
 
@@ -670,100 +834,19 @@ def start_job_processing(job_id: str):
 # API Endpoints
 # ============================================
 
-@app.get("/api/settings")
-async def get_settings_endpoint():
-    """Get current application settings (masks sensitive data)."""
-    settings = await get_settings()
-    api_key = settings.get('parasail_api_key', '')
-
-    # Mask API key for display (show last 4 chars only)
-    masked_key = ''
-    if api_key:
-        masked_key = '*' * (len(api_key) - 4) + api_key[-4:] if len(api_key) > 4 else '****'
-
-    return {
-        "configured": await is_configured(),
-        "parasail_api_key_masked": masked_key,
-        "has_api_key": bool(api_key),
-        "updated_at": settings.get('updated_at'),
-        # Include env var status for transparency
-        "env_var_set": bool(PARASAIL_API_KEY)
-    }
-
-
-@app.post("/api/settings")
-async def save_settings_endpoint(
-    parasail_api_key: str = Form(None)
-):
-    """Save application settings."""
-    if not parasail_api_key:
-        raise HTTPException(400, "API key is required")
-
-    # Basic validation
-    if len(parasail_api_key) < 10:
-        raise HTTPException(400, "API key appears to be invalid (too short)")
-
-    # Save to Firestore
-    success = await save_settings({
-        'parasail_api_key': parasail_api_key
-    })
-
-    if not success:
-        raise HTTPException(500, "Failed to save settings")
-
-    return {"status": "saved", "message": "API key saved successfully"}
-
-
-@app.post("/api/settings/test")
-async def test_api_key():
-    """Test the configured API key by making a simple API call."""
-    api_key = await get_api_key()
-
-    if not api_key:
-        raise HTTPException(400, "No API key configured")
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            # Make a minimal test request
-            payload = {
-                "model": PARASAIL_MODEL,
-                "messages": [{"role": "user", "content": "test"}],
-                "max_tokens": 1
-            }
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            }
-
-            async with session.post(
-                PARASAIL_API_URL,
-                json=payload,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as response:
-                if response.status == 200:
-                    return {"status": "success", "message": "API key is valid"}
-                elif response.status == 401:
-                    return {"status": "error", "message": "Invalid API key (unauthorized)"}
-                else:
-                    error = await response.text()
-                    return {"status": "error", "message": f"API error: {error[:100]}"}
-
-    except asyncio.TimeoutError:
-        return {"status": "error", "message": "Connection timed out"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)[:100]}
-
-
 @app.get("/api/status")
 async def get_status():
-    """Get overall app status including configuration state."""
-    configured = await is_configured()
+    """Get system status and configuration."""
+    has_api_key = bool(PARASAIL_API_KEY)
 
     return {
-        "configured": configured,
-        "ready": configured,
-        "message": "Ready to process PDFs" if configured else "Please configure your API key in Settings"
+        "status": "ready" if has_api_key else "needs_configuration",
+        "has_api_key": has_api_key,
+        "storage_mode": "cloud" if isinstance(storage, FirestoreBackend) else "local",
+        "max_concurrent_pages": MAX_CONCURRENT_PAGES,
+        "max_concurrent_jobs": MAX_CONCURRENT_JOBS,
+        "active_jobs": len(active_tasks),
+        "data_directory": str(DATA_DIR) if isinstance(storage, SQLiteBackend) else None
     }
 
 
@@ -785,7 +868,7 @@ async def create_batch_endpoint(
         "completed_files": 0
     }
 
-    await save_batch(batch)
+    await storage.save_batch(batch)
     return {"batch_id": batch_id}
 
 
@@ -796,13 +879,19 @@ async def upload_pdf(
     relative_path: str = Form(None)
 ):
     """Upload and queue a PDF for processing."""
-    if not file.filename.lower().endswith('.pdf'):
+    if not PARASAIL_API_KEY:
+        raise HTTPException(400, "PARASAIL_API_KEY not configured. Set it as an environment variable.")
+
+    if not file.filename or not file.filename.lower().endswith('.pdf'):
         raise HTTPException(400, "Only PDF files are supported")
 
     pdf_bytes = await file.read()
+    if not pdf_bytes:
+        raise HTTPException(400, "Empty file")
+
     job_id = f"job_{uuid.uuid4().hex[:12]}"
 
-    await store_pdf(job_id, pdf_bytes)
+    await storage.store_pdf(job_id, pdf_bytes)
 
     if not batch_id:
         batch_id = f"batch_{uuid.uuid4().hex[:12]}"
@@ -815,13 +904,13 @@ async def upload_pdf(
             "total_files": 1,
             "completed_files": 0
         }
-        await save_batch(new_batch)
+        await storage.save_batch(new_batch)
     else:
-        existing_batch = await get_batch(batch_id)
+        existing_batch = await storage.get_batch(batch_id)
         if existing_batch:
             existing_batch['total_files'] = existing_batch.get('total_files', 0) + 1
             existing_batch['status'] = 'processing'
-            await save_batch(existing_batch)
+            await storage.save_batch(existing_batch)
 
     job = {
         "id": job_id,
@@ -839,7 +928,7 @@ async def upload_pdf(
         "total_input_tokens": 0,
         "total_output_tokens": 0
     }
-    await save_job(job)
+    await storage.save_job(job)
 
     start_job_processing(job_id)
 
@@ -854,6 +943,9 @@ async def upload_multiple(
     relative_paths: str = Form(None)
 ):
     """Upload multiple PDFs at once."""
+    if not PARASAIL_API_KEY:
+        raise HTTPException(400, "PARASAIL_API_KEY not configured. Set it as an environment variable.")
+
     if not files:
         raise HTTPException(400, "No files provided")
 
@@ -864,11 +956,8 @@ async def upload_multiple(
         except json.JSONDecodeError:
             rel_paths = []
 
-    # Filter PDF files - check filename safely
-    pdf_files = []
-    for f in files:
-        if f.filename and f.filename.lower().endswith('.pdf'):
-            pdf_files.append(f)
+    # Filter PDF files
+    pdf_files = [f for f in files if f.filename and f.filename.lower().endswith('.pdf')]
 
     if not pdf_files:
         raise HTTPException(400, "No PDF files provided")
@@ -884,14 +973,13 @@ async def upload_multiple(
         "total_files": len(pdf_files),
         "completed_files": 0
     }
-    await save_batch(batch)
+    await storage.save_batch(batch)
 
     job_ids = []
     errors = []
 
     for i, file in enumerate(pdf_files):
         try:
-            # Read file content
             pdf_bytes = await file.read()
 
             if not pdf_bytes:
@@ -901,12 +989,7 @@ async def upload_multiple(
             job_id = f"job_{uuid.uuid4().hex[:12]}"
             rel_path = rel_paths[i] if i < len(rel_paths) else None
 
-            # Store PDF
-            try:
-                await store_pdf(job_id, pdf_bytes)
-            except Exception as e:
-                errors.append(f"{file.filename}: Storage failed - {str(e)}")
-                continue
+            await storage.store_pdf(job_id, pdf_bytes)
 
             job = {
                 "id": job_id,
@@ -924,7 +1007,7 @@ async def upload_multiple(
                 "total_input_tokens": 0,
                 "total_output_tokens": 0
             }
-            await save_job(job)
+            await storage.save_job(job)
 
             job_ids.append(job_id)
             start_job_processing(job_id)
@@ -938,7 +1021,7 @@ async def upload_multiple(
         batch['total_files'] = len(job_ids)
         if len(job_ids) == 0:
             batch['status'] = 'failed'
-        await save_batch(batch)
+        await storage.save_batch(batch)
 
     if not job_ids:
         raise HTTPException(400, f"All uploads failed: {'; '.join(errors)}")
@@ -950,34 +1033,14 @@ async def upload_multiple(
     }
 
 
-@app.patch("/api/batch/{batch_id}")
-async def update_batch_endpoint(
-    batch_id: str,
-    output_path: str = Form(None),
-    name: str = Form(None)
-):
-    """Update batch settings."""
-    batch = await get_batch(batch_id)
-    if not batch:
-        raise HTTPException(404, "Batch not found")
-
-    if output_path is not None:
-        batch['output_path'] = output_path
-    if name is not None:
-        batch['name'] = name
-
-    await save_batch(batch)
-    return {"status": "updated"}
-
-
 @app.get("/api/batch/{batch_id}")
 async def get_batch_endpoint(batch_id: str):
     """Get batch details with all jobs."""
-    batch = await get_batch(batch_id)
+    batch = await storage.get_batch(batch_id)
     if not batch:
         raise HTTPException(404, "Batch not found")
 
-    jobs = await get_batch_jobs(batch_id)
+    jobs = await storage.get_batch_jobs(batch_id)
     batch["jobs"] = jobs
 
     return batch
@@ -986,41 +1049,31 @@ async def get_batch_endpoint(batch_id: str):
 @app.get("/api/batches")
 async def list_batches_endpoint():
     """List all batches."""
-    return await list_batches()
+    return await storage.list_batches()
 
 
 @app.get("/api/jobs/{job_id}")
 async def get_job_endpoint(job_id: str):
     """Get job status and details."""
-    job = await get_job(job_id)
+    job = await storage.get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
-
-    if job["status"] == "completed":
-        job["pages"] = await get_pages(job_id)
-
     return job
 
 
 @app.get("/api/jobs/{job_id}/output")
 async def get_job_output(job_id: str):
     """Get the markdown output for a completed job."""
-    job = await get_job(job_id)
+    job = await storage.get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
 
     if job["status"] != "completed":
         raise HTTPException(400, "Job not completed")
 
-    output = await get_output(job_id)
-
+    output = await storage.get_output(job_id)
     if not output:
-        pages = await get_pages(job_id)
-        output = "\n\n---\n\n".join(
-            f"## Page {p['page_num']}\n\n{p['text']}" if not p.get('error')
-            else f"## Page {p['page_num']}\n\n[Error: {p['error']}]"
-            for p in pages
-        )
+        raise HTTPException(404, "Output not found")
 
     return {"filename": job["filename"], "text": output}
 
@@ -1031,22 +1084,22 @@ async def delete_job_endpoint(job_id: str):
     if job_id in active_tasks:
         active_tasks[job_id].cancel()
 
-    await delete_job_doc(job_id)
+    await storage.delete_job(job_id)
     return {"status": "deleted"}
 
 
 @app.delete("/api/batch/{batch_id}")
 async def delete_batch_endpoint(batch_id: str):
     """Delete a batch and all its jobs."""
-    jobs = await get_batch_jobs(batch_id)
+    jobs = await storage.get_batch_jobs(batch_id)
 
     for job in jobs:
         job_id = job['id']
         if job_id in active_tasks:
             active_tasks[job_id].cancel()
-        await delete_job_doc(job_id)
+        await storage.delete_job(job_id)
 
-    await delete_batch_doc(batch_id)
+    await storage.delete_batch(batch_id)
 
     return {"status": "deleted"}
 
@@ -1054,22 +1107,16 @@ async def delete_batch_endpoint(batch_id: str):
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    try:
-        fs = get_firestore()
-        await fs.collection(BATCHES_COLLECTION).limit(1).get()
-        firestore_status = "connected"
-    except Exception:
-        firestore_status = "disconnected"
-
     return {
         "status": "healthy",
-        "service": "olmocr-batch-v2",
-        "firestore": firestore_status
+        "service": "olmocr-batch-v3",
+        "storage_mode": "cloud" if isinstance(storage, FirestoreBackend) else "local",
+        "has_api_key": bool(PARASAIL_API_KEY)
     }
 
 
 # ============================================
-# Frontend
+# Frontend HTML
 # ============================================
 
 HTML_TEMPLATE = """
@@ -1078,29 +1125,20 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>olmOCR Batch Processor</title>
+    <title>olmOCR - PDF to Markdown</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
     <style>
         .dropzone { transition: all 0.3s ease; }
-        .dropzone.dragover { border-color: #3b82f6; background-color: #eff6ff; }
+        .dropzone.dragover { border-color: #3b82f6; background-color: #eff6ff; transform: scale(1.01); }
         .prose { max-width: none; }
-        .prose pre {
-            background: #1f2937;
-            color: #e5e7eb;
-            padding: 1rem;
-            border-radius: 0.5rem;
-            overflow-x: auto;
-        }
-        .prose code {
-            background: #e5e7eb;
-            padding: 0.2rem 0.4rem;
-            border-radius: 0.25rem;
-        }
+        .prose pre { background: #1f2937; color: #e5e7eb; padding: 1rem; border-radius: 0.5rem; overflow-x: auto; }
+        .prose code { background: #e5e7eb; padding: 0.2rem 0.4rem; border-radius: 0.25rem; font-size: 0.9em; }
         .prose pre code { background: transparent; padding: 0; }
+        .prose table { border-collapse: collapse; width: 100%; }
+        .prose th, .prose td { border: 1px solid #d1d5db; padding: 0.5rem; }
         .file-tree { font-family: monospace; font-size: 0.875rem; }
-        .file-tree-item { padding: 0.25rem 0; }
         .spinner { animation: spin 1s linear infinite; }
         @keyframes spin { to { transform: rotate(360deg); } }
         .status-pending { background-color: #fef3c7; color: #92400e; }
@@ -1109,294 +1147,144 @@ HTML_TEMPLATE = """
         .status-failed { background-color: #fee2e2; color: #991b1b; }
         .status-queued { background-color: #e5e7eb; color: #374151; }
         .dot-pending { background-color: #f59e0b; }
-        .dot-processing { background-color: #3b82f6; }
+        .dot-processing { background-color: #3b82f6; animation: pulse 1.5s infinite; }
         .dot-completed { background-color: #10b981; }
         .dot-failed { background-color: #ef4444; }
         .dot-queued { background-color: #6b7280; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .fade-in { animation: fadeIn 0.3s ease-in; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
     </style>
 </head>
-<body class="bg-gray-100 min-h-screen">
-    <!-- Setup Wizard Modal (shows when not configured) -->
-    <div id="setupModal" class="hidden fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center p-4">
-        <div class="bg-white rounded-2xl shadow-2xl max-w-md w-full p-8">
-            <div class="text-center mb-6">
-                <div class="w-16 h-16 bg-blue-100 rounded-full flex items-center justify-center mx-auto mb-4">
-                    <svg class="w-8 h-8 text-blue-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                              d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/>
-                    </svg>
-                </div>
-                <h2 class="text-2xl font-bold text-gray-800 mb-2">Welcome to olmOCR!</h2>
-                <p class="text-gray-600">
-                    To get started, enter your Parasail API key below.
-                </p>
-            </div>
-
-            <div class="mb-4">
-                <label class="block text-sm font-medium text-gray-700 mb-2">
-                    Parasail API Key
-                </label>
-                <input type="password" id="setupApiKey"
-                       placeholder="psk-..."
-                       class="w-full px-4 py-3 border border-gray-300 rounded-lg
-                              focus:ring-2 focus:ring-blue-500 focus:border-transparent">
-                <p class="text-xs text-gray-500 mt-2">
-                    Get your API key at <a href="https://parasail.io" target="_blank"
-                                           class="text-blue-600 hover:underline">parasail.io</a>
-                </p>
-            </div>
-
-            <div id="setupError" class="hidden mb-4 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
-            </div>
-
-            <div id="setupSuccess" class="hidden mb-4 p-3 bg-green-50 border border-green-200 rounded-lg text-green-700 text-sm">
-            </div>
-
-            <div class="flex gap-3">
-                <button onclick="testSetupKey()"
-                        class="flex-1 px-4 py-3 bg-gray-100 text-gray-700 rounded-lg
-                               hover:bg-gray-200 font-medium transition">
-                    Test Key
-                </button>
-                <button onclick="saveSetupKey()" id="setupSaveBtn"
-                        class="flex-1 px-4 py-3 bg-blue-500 text-white rounded-lg
-                               hover:bg-blue-600 font-medium transition">
-                    Save & Continue
-                </button>
-            </div>
-        </div>
-    </div>
-
-    <!-- Settings Modal -->
-    <div id="settingsModal" class="hidden fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center p-4">
-        <div class="bg-white rounded-2xl shadow-2xl max-w-md w-full p-8">
-            <div class="flex justify-between items-center mb-6">
-                <h2 class="text-xl font-bold text-gray-800">Settings</h2>
-                <button onclick="closeSettings()" class="text-gray-400 hover:text-gray-600">
-                    <svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
-                    </svg>
-                </button>
-            </div>
-
-            <div class="mb-4">
-                <label class="block text-sm font-medium text-gray-700 mb-2">
-                    Parasail API Key
-                </label>
-                <div class="flex gap-2">
-                    <input type="password" id="settingsApiKey"
-                           placeholder="Enter new API key or leave blank to keep current"
-                           class="flex-1 px-4 py-2 border border-gray-300 rounded-lg
-                                  focus:ring-2 focus:ring-blue-500 focus:border-transparent">
-                    <button onclick="toggleKeyVisibility('settingsApiKey')"
-                            class="px-3 py-2 bg-gray-100 rounded-lg hover:bg-gray-200">
-                        <svg class="w-5 h-5 text-gray-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                                  d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                                  d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/>
-                        </svg>
-                    </button>
-                </div>
-                <p id="currentKeyInfo" class="text-xs text-gray-500 mt-2"></p>
-            </div>
-
-            <div id="settingsError" class="hidden mb-4 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
-            </div>
-
-            <div id="settingsSuccess" class="hidden mb-4 p-3 bg-green-50 border border-green-200 rounded-lg text-green-700 text-sm">
-            </div>
-
-            <div class="flex gap-3">
-                <button onclick="testSettingsKey()"
-                        class="flex-1 px-4 py-2 bg-gray-100 text-gray-700 rounded-lg
-                               hover:bg-gray-200 font-medium transition">
-                    Test Connection
-                </button>
-                <button onclick="saveSettingsKey()"
-                        class="flex-1 px-4 py-2 bg-blue-500 text-white rounded-lg
-                               hover:bg-blue-600 font-medium transition">
-                    Save Changes
-                </button>
-            </div>
-        </div>
-    </div>
-
+<body class="bg-gradient-to-br from-slate-50 to-blue-50 min-h-screen">
     <div class="container mx-auto px-4 py-8 max-w-6xl">
-        <!-- Header with Settings Button -->
-        <div class="flex justify-between items-start mb-8">
-            <div class="text-center flex-1">
-                <h1 class="text-4xl font-bold text-gray-800 mb-2">
-                    olmOCR Batch Processor
-                </h1>
-                <p class="text-gray-600">
-                    High-performance PDF to Markdown - Upload files or folders
-                </p>
-                <p class="text-sm text-green-600 mt-2" id="statusMessage">
-                    Jobs persist even if you close this page
-                </p>
-            </div>
-            <button onclick="openSettings()"
-                    class="flex items-center gap-2 px-4 py-2 bg-gray-100 text-gray-700
-                           rounded-lg hover:bg-gray-200 transition">
-                <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                          d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/>
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                          d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
-                </svg>
-                <span class="hidden sm:inline">Settings</span>
-            </button>
+        <!-- Header -->
+        <div class="text-center mb-8">
+            <h1 class="text-4xl font-bold bg-gradient-to-r from-blue-600 to-purple-600 bg-clip-text text-transparent mb-2">
+                olmOCR
+            </h1>
+            <p class="text-gray-600 text-lg">
+                High-performance PDF to Markdown conversion
+            </p>
+            <div id="statusBadge" class="mt-3"></div>
         </div>
 
-        <!-- Main Content (disabled when not configured) -->
-        <div id="mainContent">
+        <!-- API Key Warning -->
+        <div id="apiKeyWarning" class="hidden mb-6 bg-yellow-50 border border-yellow-200 rounded-xl p-4">
+            <div class="flex items-start gap-3">
+                <svg class="w-6 h-6 text-yellow-500 flex-shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                </svg>
+                <div>
+                    <h3 class="font-semibold text-yellow-800">API Key Required</h3>
+                    <p class="text-yellow-700 text-sm mt-1">
+                        Set the <code class="bg-yellow-100 px-1 rounded">PARASAIL_API_KEY</code> environment variable to enable processing.
+                        Get a key from <a href="https://parasail.io" target="_blank" class="underline hover:text-yellow-900">parasail.io</a>
+                    </p>
+                </div>
+            </div>
+        </div>
 
-        <div class="bg-white rounded-xl shadow-lg p-6 mb-8">
+        <!-- Upload Section -->
+        <div class="bg-white rounded-2xl shadow-xl p-6 mb-8">
+            <!-- Mode Tabs -->
             <div class="flex border-b border-gray-200 mb-6">
                 <button onclick="setUploadMode('files')" id="modeFiles"
-                    class="px-6 py-3 border-b-2 border-blue-500 text-blue-600 font-medium">
-                    Upload Files
+                    class="px-6 py-3 border-b-2 border-blue-500 text-blue-600 font-medium transition-colors">
+                    <span class="flex items-center gap-2">
+                        <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                        </svg>
+                        Upload Files
+                    </span>
                 </button>
                 <button onclick="setUploadMode('folder')" id="modeFolder"
-                    class="px-6 py-3 text-gray-500 hover:text-gray-700 font-medium">
-                    Upload Folder
+                    class="px-6 py-3 text-gray-500 hover:text-gray-700 font-medium transition-colors">
+                    <span class="flex items-center gap-2">
+                        <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                        </svg>
+                        Upload Folder
+                    </span>
                 </button>
             </div>
 
-            <div class="mb-6">
-                <label class="block text-sm font-medium text-gray-700 mb-2">
-                    Batch Name (optional)
-                </label>
-                <input type="text" id="batchName"
-                    placeholder="Name for this batch of files"
-                    class="w-full px-4 py-2 border border-gray-300 rounded-lg mb-4
-                           focus:ring-2 focus:ring-blue-500 focus:border-transparent">
-
-                <label class="block text-sm font-medium text-gray-700 mb-2">
-                    Output Folder Path (optional)
-                </label>
-                <div class="flex gap-4">
-                    <input type="text" id="outputPath"
-                        placeholder="e.g., /documents/ocr-output or C:\\Documents\\Output"
-                        class="flex-1 px-4 py-2 border border-gray-300 rounded-lg
-                               focus:ring-2 focus:ring-blue-500 focus:border-transparent">
-                    <label class="flex items-center gap-2 text-sm text-gray-600">
-                        <input type="checkbox" id="preserveStructure" checked
-                               class="rounded">
-                        Preserve folder structure
-                    </label>
+            <!-- Options -->
+            <div class="grid md:grid-cols-2 gap-4 mb-6">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Batch Name (optional)</label>
+                    <input type="text" id="batchName" placeholder="Name for this batch"
+                        class="w-full px-4 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent transition">
                 </div>
-                <p class="text-xs text-gray-500 mt-1">
-                    Note: Output files are downloaded via browser. This path is saved with the batch for reference.
-                </p>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">Output Reference (optional)</label>
+                    <input type="text" id="outputPath" placeholder="e.g., /documents/output"
+                        class="w-full px-4 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent transition">
+                </div>
             </div>
 
+            <!-- File Upload Area -->
             <div id="fileUploadArea">
-                <div id="dropzone"
-                     class="dropzone border-2 border-dashed border-gray-300 rounded-xl
-                            p-12 text-center cursor-pointer hover:border-blue-400">
-                    <input type="file" id="fileInput" class="hidden"
-                           accept=".pdf" multiple>
-                    <svg class="mx-auto h-16 w-16 text-gray-400 mb-4" fill="none"
-                         viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round"
-                              stroke-width="1.5"
-                              d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5
-                                 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/>
+                <div id="dropzone" class="dropzone border-2 border-dashed border-gray-300 rounded-xl p-12 text-center cursor-pointer hover:border-blue-400 hover:bg-blue-50/30 transition-all">
+                    <input type="file" id="fileInput" class="hidden" accept=".pdf" multiple>
+                    <svg class="mx-auto h-16 w-16 text-gray-400 mb-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/>
                     </svg>
-                    <p class="text-xl text-gray-600 mb-2">
-                        Drop PDF files here or click to upload
-                    </p>
-                    <p class="text-sm text-gray-400">
-                        Select multiple PDFs to process in parallel
-                    </p>
+                    <p class="text-xl text-gray-600 mb-2">Drop PDF files here or click to upload</p>
+                    <p class="text-sm text-gray-400">Select multiple PDFs for batch processing</p>
                 </div>
             </div>
 
+            <!-- Folder Upload Area -->
             <div id="folderUploadArea" class="hidden">
-                <div id="folderDropzone"
-                     class="dropzone border-2 border-dashed border-gray-300 rounded-xl
-                            p-12 text-center cursor-pointer hover:border-blue-400">
-                    <input type="file" id="folderInput" class="hidden"
-                           webkitdirectory directory multiple>
-                    <svg class="mx-auto h-16 w-16 text-gray-400 mb-4" fill="none"
-                         viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round"
-                              stroke-width="1.5"
-                              d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2
-                                 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/>
+                <div id="folderDropzone" class="dropzone border-2 border-dashed border-gray-300 rounded-xl p-12 text-center cursor-pointer hover:border-blue-400 hover:bg-blue-50/30 transition-all">
+                    <input type="file" id="folderInput" class="hidden" webkitdirectory directory multiple>
+                    <svg class="mx-auto h-16 w-16 text-gray-400 mb-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/>
                     </svg>
-                    <p class="text-xl text-gray-600 mb-2">
-                        Click to select a folder
-                    </p>
-                    <p class="text-sm text-gray-400">
-                        All PDFs in the folder and subfolders will be processed
-                    </p>
+                    <p class="text-xl text-gray-600 mb-2">Click to select a folder</p>
+                    <p class="text-sm text-gray-400">All PDFs in the folder and subfolders will be processed</p>
                 </div>
             </div>
 
-            <div id="stagedFiles" class="hidden mt-6">
+            <!-- Staged Files -->
+            <div id="stagedFiles" class="hidden mt-6 fade-in">
                 <div class="flex justify-between items-center mb-4">
                     <h3 class="text-lg font-semibold text-gray-800">
-                        Files to Process: <span id="stagedCount">0</span>
+                        Files to Process: <span id="stagedCount" class="text-blue-600">0</span>
                     </h3>
                     <div class="space-x-2">
-                        <button onclick="clearStaged()"
-                                class="px-4 py-2 bg-gray-200 text-gray-700
-                                       rounded-lg hover:bg-gray-300">
-                            Clear
-                        </button>
-                        <button onclick="startProcessing()" id="startBtn"
-                                class="px-6 py-2 bg-blue-500 text-white
-                                       rounded-lg hover:bg-blue-600 font-medium">
+                        <button onclick="clearStaged()" class="px-4 py-2 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 transition">Clear</button>
+                        <button onclick="startProcessing()" id="startBtn" class="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium transition shadow-lg shadow-blue-200">
                             Start Processing
                         </button>
                     </div>
                 </div>
-                <div id="stagedList"
-                     class="file-tree bg-gray-50 rounded-lg p-4 max-h-60 overflow-y-auto">
-                </div>
+                <div id="stagedList" class="file-tree bg-gray-50 rounded-lg p-4 max-h-60 overflow-y-auto"></div>
             </div>
         </div>
 
+        <!-- Batches Section -->
         <div id="batchesSection" class="space-y-4 mb-8"></div>
 
-        <div id="outputSection" class="hidden">
-            <div class="bg-white rounded-xl shadow-lg overflow-hidden">
-                <div class="border-b border-gray-200 p-4
-                            flex justify-between items-center">
-                    <h2 id="outputTitle"
-                        class="text-xl font-semibold text-gray-800">Output</h2>
+        <!-- Output Section -->
+        <div id="outputSection" class="hidden fade-in">
+            <div class="bg-white rounded-2xl shadow-xl overflow-hidden">
+                <div class="border-b border-gray-200 p-4 flex justify-between items-center bg-gradient-to-r from-blue-50 to-purple-50">
+                    <h2 id="outputTitle" class="text-xl font-semibold text-gray-800">Output</h2>
                     <div class="space-x-2">
-                        <button onclick="copyOutput()"
-                                class="px-4 py-2 bg-gray-100 text-gray-700
-                                       rounded-lg hover:bg-gray-200 transition">
-                            Copy
-                        </button>
-                        <button onclick="downloadOutput()"
-                                class="px-4 py-2 bg-blue-500 text-white
-                                       rounded-lg hover:bg-blue-600 transition">
-                            Download .md
-                        </button>
+                        <button onclick="copyOutput()" class="px-4 py-2 bg-white text-gray-700 rounded-lg hover:bg-gray-100 transition border">Copy</button>
+                        <button onclick="downloadOutput()" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition">Download .md</button>
                     </div>
                 </div>
                 <div class="p-6">
                     <div class="flex border-b border-gray-200 mb-4">
-                        <button onclick="showTab('rendered')" id="tabRendered"
-                                class="px-4 py-2 border-b-2 border-blue-500
-                                       text-blue-600 font-medium">
-                            Rendered
-                        </button>
-                        <button onclick="showTab('raw')" id="tabRaw"
-                                class="px-4 py-2 text-gray-500 hover:text-gray-700">
-                            Raw Markdown
-                        </button>
+                        <button onclick="showTab('rendered')" id="tabRendered" class="px-4 py-2 border-b-2 border-blue-500 text-blue-600 font-medium">Rendered</button>
+                        <button onclick="showTab('raw')" id="tabRaw" class="px-4 py-2 text-gray-500 hover:text-gray-700">Raw Markdown</button>
                     </div>
                     <div id="renderedOutput" class="prose prose-lg max-w-none"></div>
                     <div id="rawOutput" class="hidden">
-                        <pre class="bg-gray-900 text-gray-100 p-4 rounded-lg
-                                    overflow-x-auto whitespace-pre-wrap text-sm"></pre>
+                        <pre class="bg-gray-900 text-gray-100 p-4 rounded-lg overflow-x-auto whitespace-pre-wrap text-sm"></pre>
                     </div>
                 </div>
             </div>
@@ -1411,246 +1299,31 @@ HTML_TEMPLATE = """
         let stagedFiles = [];
         let activeBatches = {};
         let pollIntervals = {};
-        let isConfigured = false;
+        let hasApiKey = true;
 
-        // ============================================
-        // Settings & Setup Functions
-        // ============================================
-
-        async function checkConfiguration() {
+        // Check status on load
+        async function checkStatus() {
             try {
-                const response = await fetch('/api/status');
-                const data = await response.json();
-                isConfigured = data.configured;
+                const resp = await fetch('/api/status');
+                const data = await resp.json();
+                hasApiKey = data.has_api_key;
 
-                if (!isConfigured) {
-                    showSetupWizard();
-                    document.getElementById('mainContent').style.opacity = '0.5';
-                    document.getElementById('mainContent').style.pointerEvents = 'none';
+                const badge = document.getElementById('statusBadge');
+                const warning = document.getElementById('apiKeyWarning');
+
+                if (!hasApiKey) {
+                    warning.classList.remove('hidden');
+                    badge.innerHTML = '<span class="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-yellow-100 text-yellow-800">Setup Required</span>';
                 } else {
-                    hideSetupWizard();
-                    document.getElementById('mainContent').style.opacity = '1';
-                    document.getElementById('mainContent').style.pointerEvents = 'auto';
-                    document.getElementById('statusMessage').textContent = 'Ready - Jobs persist even if you close this page';
-                    document.getElementById('statusMessage').classList.remove('text-yellow-600');
-                    document.getElementById('statusMessage').classList.add('text-green-600');
+                    warning.classList.add('hidden');
+                    const mode = data.storage_mode === 'cloud' ? 'Cloud' : 'Local';
+                    badge.innerHTML = '<span class="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-green-100 text-green-800">' + mode + ' Mode Ready</span>';
                 }
-            } catch (error) {
-                console.error('Failed to check configuration:', error);
+            } catch (e) {
+                console.error('Status check failed:', e);
             }
         }
-
-        function showSetupWizard() {
-            document.getElementById('setupModal').classList.remove('hidden');
-        }
-
-        function hideSetupWizard() {
-            document.getElementById('setupModal').classList.add('hidden');
-        }
-
-        function openSettings() {
-            loadCurrentSettings();
-            document.getElementById('settingsModal').classList.remove('hidden');
-        }
-
-        function closeSettings() {
-            document.getElementById('settingsModal').classList.add('hidden');
-            document.getElementById('settingsError').classList.add('hidden');
-            document.getElementById('settingsSuccess').classList.add('hidden');
-            document.getElementById('settingsApiKey').value = '';
-        }
-
-        async function loadCurrentSettings() {
-            try {
-                const response = await fetch('/api/settings');
-                const data = await response.json();
-
-                if (data.has_api_key) {
-                    document.getElementById('currentKeyInfo').textContent =
-                        `Current key: ${data.parasail_api_key_masked}`;
-                } else if (data.env_var_set) {
-                    document.getElementById('currentKeyInfo').textContent =
-                        'Using API key from environment variable';
-                } else {
-                    document.getElementById('currentKeyInfo').textContent =
-                        'No API key configured';
-                }
-            } catch (error) {
-                console.error('Failed to load settings:', error);
-            }
-        }
-
-        function toggleKeyVisibility(inputId) {
-            const input = document.getElementById(inputId);
-            input.type = input.type === 'password' ? 'text' : 'password';
-        }
-
-        async function testSetupKey() {
-            const apiKey = document.getElementById('setupApiKey').value.trim();
-            if (!apiKey) {
-                showSetupError('Please enter an API key');
-                return;
-            }
-
-            // First save, then test
-            const formData = new FormData();
-            formData.append('parasail_api_key', apiKey);
-
-            try {
-                const saveResponse = await fetch('/api/settings', {
-                    method: 'POST',
-                    body: formData
-                });
-
-                if (!saveResponse.ok) {
-                    const error = await saveResponse.json();
-                    showSetupError(error.detail || 'Failed to save key');
-                    return;
-                }
-
-                // Now test it
-                const testResponse = await fetch('/api/settings/test', { method: 'POST' });
-                const testData = await testResponse.json();
-
-                if (testData.status === 'success') {
-                    showSetupSuccess('API key is valid!');
-                } else {
-                    showSetupError(testData.message);
-                }
-            } catch (error) {
-                showSetupError('Connection failed: ' + error.message);
-            }
-        }
-
-        async function saveSetupKey() {
-            const apiKey = document.getElementById('setupApiKey').value.trim();
-            if (!apiKey) {
-                showSetupError('Please enter an API key');
-                return;
-            }
-
-            const formData = new FormData();
-            formData.append('parasail_api_key', apiKey);
-
-            try {
-                const response = await fetch('/api/settings', {
-                    method: 'POST',
-                    body: formData
-                });
-
-                if (response.ok) {
-                    showSetupSuccess('API key saved! Redirecting...');
-                    setTimeout(() => {
-                        hideSetupWizard();
-                        checkConfiguration();
-                    }, 1000);
-                } else {
-                    const error = await response.json();
-                    showSetupError(error.detail || 'Failed to save');
-                }
-            } catch (error) {
-                showSetupError('Failed to save: ' + error.message);
-            }
-        }
-
-        async function testSettingsKey() {
-            const apiKey = document.getElementById('settingsApiKey').value.trim();
-
-            // If a new key is provided, save it first
-            if (apiKey) {
-                const formData = new FormData();
-                formData.append('parasail_api_key', apiKey);
-
-                try {
-                    const saveResponse = await fetch('/api/settings', {
-                        method: 'POST',
-                        body: formData
-                    });
-
-                    if (!saveResponse.ok) {
-                        const error = await saveResponse.json();
-                        showSettingsError(error.detail || 'Failed to save key');
-                        return;
-                    }
-                } catch (error) {
-                    showSettingsError('Failed to save: ' + error.message);
-                    return;
-                }
-            }
-
-            // Test the current key
-            try {
-                const response = await fetch('/api/settings/test', { method: 'POST' });
-                const data = await response.json();
-
-                if (data.status === 'success') {
-                    showSettingsSuccess('Connection successful! API key is valid.');
-                } else {
-                    showSettingsError(data.message);
-                }
-            } catch (error) {
-                showSettingsError('Test failed: ' + error.message);
-            }
-        }
-
-        async function saveSettingsKey() {
-            const apiKey = document.getElementById('settingsApiKey').value.trim();
-
-            if (!apiKey) {
-                showSettingsError('Please enter a new API key');
-                return;
-            }
-
-            const formData = new FormData();
-            formData.append('parasail_api_key', apiKey);
-
-            try {
-                const response = await fetch('/api/settings', {
-                    method: 'POST',
-                    body: formData
-                });
-
-                if (response.ok) {
-                    showSettingsSuccess('API key saved successfully!');
-                    loadCurrentSettings();
-                    document.getElementById('settingsApiKey').value = '';
-                    checkConfiguration();
-                } else {
-                    const error = await response.json();
-                    showSettingsError(error.detail || 'Failed to save');
-                }
-            } catch (error) {
-                showSettingsError('Failed to save: ' + error.message);
-            }
-        }
-
-        function showSetupError(message) {
-            const el = document.getElementById('setupError');
-            el.textContent = message;
-            el.classList.remove('hidden');
-            document.getElementById('setupSuccess').classList.add('hidden');
-        }
-
-        function showSetupSuccess(message) {
-            const el = document.getElementById('setupSuccess');
-            el.textContent = message;
-            el.classList.remove('hidden');
-            document.getElementById('setupError').classList.add('hidden');
-        }
-
-        function showSettingsError(message) {
-            const el = document.getElementById('settingsError');
-            el.textContent = message;
-            el.classList.remove('hidden');
-            document.getElementById('settingsSuccess').classList.add('hidden');
-        }
-
-        function showSettingsSuccess(message) {
-            const el = document.getElementById('settingsSuccess');
-            el.textContent = message;
-            el.classList.remove('hidden');
-            document.getElementById('settingsError').classList.add('hidden');
-        }
+        checkStatus();
 
         function setUploadMode(mode) {
             uploadMode = mode;
@@ -1667,35 +1340,24 @@ HTML_TEMPLATE = """
             folderBtn.classList.toggle('text-blue-600', mode === 'folder');
             folderBtn.classList.toggle('text-gray-500', mode !== 'folder');
 
-            document.getElementById('fileUploadArea')
-                .classList.toggle('hidden', mode !== 'files');
-            document.getElementById('folderUploadArea')
-                .classList.toggle('hidden', mode !== 'folder');
-
+            document.getElementById('fileUploadArea').classList.toggle('hidden', mode !== 'files');
+            document.getElementById('folderUploadArea').classList.toggle('hidden', mode !== 'folder');
             clearStaged();
         }
 
+        // File upload handlers
         const dropzone = document.getElementById('dropzone');
         const fileInput = document.getElementById('fileInput');
 
         dropzone.addEventListener('click', () => fileInput.click());
-        dropzone.addEventListener('dragover', (e) => {
-            e.preventDefault();
-            dropzone.classList.add('dragover');
-        });
-        dropzone.addEventListener('dragleave', () => {
-            dropzone.classList.remove('dragover');
-        });
+        dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
+        dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
         dropzone.addEventListener('drop', async (e) => {
             e.preventDefault();
             dropzone.classList.remove('dragover');
-            // Handle dropped items - check for folders
             const items = e.dataTransfer.items;
-            if (items && items.length > 0) {
-                await handleDroppedItems(items);
-            } else {
-                handleFiles(e.dataTransfer.files);
-            }
+            if (items && items.length > 0) await handleDroppedItems(items);
+            else handleFiles(e.dataTransfer.files);
         });
         fileInput.addEventListener('change', (e) => handleFiles(e.target.files));
 
@@ -1703,37 +1365,24 @@ HTML_TEMPLATE = """
         const folderInput = document.getElementById('folderInput');
 
         folderDropzone.addEventListener('click', () => folderInput.click());
-        folderDropzone.addEventListener('dragover', (e) => {
-            e.preventDefault();
-            folderDropzone.classList.add('dragover');
-        });
-        folderDropzone.addEventListener('dragleave', () => {
-            folderDropzone.classList.remove('dragover');
-        });
+        folderDropzone.addEventListener('dragover', (e) => { e.preventDefault(); folderDropzone.classList.add('dragover'); });
+        folderDropzone.addEventListener('dragleave', () => folderDropzone.classList.remove('dragover'));
         folderDropzone.addEventListener('drop', async (e) => {
             e.preventDefault();
             folderDropzone.classList.remove('dragover');
             const items = e.dataTransfer.items;
-            if (items && items.length > 0) {
-                await handleDroppedItems(items);
-            }
+            if (items && items.length > 0) await handleDroppedItems(items);
         });
         folderInput.addEventListener('change', (e) => handleFolderFiles(e.target.files));
 
-        // Recursively traverse dropped folder items
         async function handleDroppedItems(items) {
             const files = [];
-
             async function traverseEntry(entry, path = '') {
                 if (entry.isFile) {
                     return new Promise((resolve) => {
                         entry.file((file) => {
                             if (file.name.toLowerCase().endsWith('.pdf')) {
-                                files.push({
-                                    file: file,
-                                    relativePath: path + file.name,
-                                    name: file.name
-                                });
+                                files.push({ file, relativePath: path + file.name, name: file.name });
                             }
                             resolve();
                         });
@@ -1743,13 +1392,10 @@ HTML_TEMPLATE = """
                     return new Promise((resolve) => {
                         const readEntries = () => {
                             reader.readEntries(async (entries) => {
-                                if (entries.length === 0) {
-                                    resolve();
-                                } else {
-                                    for (const e of entries) {
-                                        await traverseEntry(e, path + entry.name + '/');
-                                    }
-                                    readEntries(); // Continue reading (may have more entries)
+                                if (entries.length === 0) resolve();
+                                else {
+                                    for (const e of entries) await traverseEntry(e, path + entry.name + '/');
+                                    readEntries();
                                 }
                             });
                         };
@@ -1757,23 +1403,16 @@ HTML_TEMPLATE = """
                     });
                 }
             }
-
             for (const item of items) {
                 const entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
-                if (entry) {
-                    await traverseEntry(entry);
-                } else if (item.kind === 'file') {
+                if (entry) await traverseEntry(entry);
+                else if (item.kind === 'file') {
                     const file = item.getAsFile();
                     if (file && file.name.toLowerCase().endsWith('.pdf')) {
-                        files.push({
-                            file: file,
-                            relativePath: null,
-                            name: file.name
-                        });
+                        files.push({ file, relativePath: null, name: file.name });
                     }
                 }
             }
-
             stagedFiles = stagedFiles.concat(files);
             updateStagedDisplay();
         }
@@ -1781,11 +1420,7 @@ HTML_TEMPLATE = """
         function handleFiles(files) {
             for (const file of files) {
                 if (file.name.toLowerCase().endsWith('.pdf')) {
-                    stagedFiles.push({
-                        file: file,
-                        relativePath: null,
-                        name: file.name
-                    });
+                    stagedFiles.push({ file, relativePath: null, name: file.name });
                 }
             }
             updateStagedDisplay();
@@ -1795,11 +1430,7 @@ HTML_TEMPLATE = """
             for (const file of files) {
                 if (file.name.toLowerCase().endsWith('.pdf')) {
                     const relativePath = file.webkitRelativePath || file.name;
-                    stagedFiles.push({
-                        file: file,
-                        relativePath: relativePath,
-                        name: file.name
-                    });
+                    stagedFiles.push({ file, relativePath, name: file.name });
                 }
             }
             updateStagedDisplay();
@@ -1810,10 +1441,7 @@ HTML_TEMPLATE = """
             const list = document.getElementById('stagedList');
             const count = document.getElementById('stagedCount');
 
-            if (stagedFiles.length === 0) {
-                container.classList.add('hidden');
-                return;
-            }
+            if (stagedFiles.length === 0) { container.classList.add('hidden'); return; }
 
             container.classList.remove('hidden');
             count.textContent = stagedFiles.length;
@@ -1822,14 +1450,11 @@ HTML_TEMPLATE = """
             stagedFiles.forEach((item, idx) => {
                 const path = item.relativePath || '';
                 const parts = path.split('/');
-                const folder = parts.length > 1
-                    ? parts.slice(0, -1).join('/')
-                    : '(root)';
+                const folder = parts.length > 1 ? parts.slice(0, -1).join('/') : '(root)';
                 if (!byFolder[folder]) byFolder[folder] = [];
                 byFolder[folder].push({ ...item, idx });
             });
 
-            // Sort folders alphabetically
             const sortedFolders = Object.keys(byFolder).sort((a, b) => {
                 if (a === '(root)') return -1;
                 if (b === '(root)') return 1;
@@ -1839,38 +1464,20 @@ HTML_TEMPLATE = """
             let html = '';
             for (const folder of sortedFolders) {
                 const files = byFolder[folder];
-                if (folder !== '(root)') {
-                    html += `<div class="font-bold text-gray-700 mt-2">
-                        &#128193; ${folder}/</div>`;
-                }
+                if (folder !== '(root)') html += '<div class="font-bold text-gray-700 mt-2">📁 ' + folder + '/</div>';
                 for (const f of files) {
-                    html += `<div class="file-tree-item flex justify-between
-                                         items-center pl-4">
-                        <span>&#128196; ${f.name}</span>
-                        <button onclick="removeStaged(${f.idx})"
-                                class="text-red-500 hover:text-red-700 text-sm px-2">
-                            &times;
-                        </button>
-                    </div>`;
+                    html += '<div class="flex justify-between items-center pl-4 py-1 hover:bg-gray-100 rounded"><span>📄 ' + f.name + '</span><button onclick="removeStaged(' + f.idx + ')" class="text-red-500 hover:text-red-700 px-2">×</button></div>';
                 }
             }
             list.innerHTML = html;
         }
 
-        function removeStaged(idx) {
-            stagedFiles.splice(idx, 1);
-            updateStagedDisplay();
-        }
-
-        function clearStaged() {
-            stagedFiles = [];
-            updateStagedDisplay();
-            fileInput.value = '';
-            folderInput.value = '';
-        }
+        function removeStaged(idx) { stagedFiles.splice(idx, 1); updateStagedDisplay(); }
+        function clearStaged() { stagedFiles = []; updateStagedDisplay(); fileInput.value = ''; folderInput.value = ''; }
 
         async function startProcessing() {
             if (stagedFiles.length === 0) return;
+            if (!hasApiKey) { alert('Please set PARASAIL_API_KEY environment variable first.'); return; }
 
             const startBtn = document.getElementById('startBtn');
             startBtn.disabled = true;
@@ -1878,55 +1485,36 @@ HTML_TEMPLATE = """
 
             const outputPath = document.getElementById('outputPath').value.trim();
             const batchNameInput = document.getElementById('batchName').value.trim();
-            const preserveStructure = document.getElementById('preserveStructure').checked;
 
             const formData = new FormData();
             const relativePaths = [];
 
             for (const item of stagedFiles) {
                 formData.append('files', item.file);
-                if (preserveStructure && item.relativePath) {
-                    relativePaths.push(item.relativePath);
-                } else {
-                    relativePaths.push(null);
-                }
+                relativePaths.push(item.relativePath || null);
             }
 
             formData.append('relative_paths', JSON.stringify(relativePaths));
-            if (outputPath) {
-                formData.append('output_path', outputPath);
-            }
+            if (outputPath) formData.append('output_path', outputPath);
 
-            let batchName = batchNameInput;
-            if (!batchName) {
-                batchName = uploadMode === 'folder'
-                    ? `Folder: ${stagedFiles[0]?.relativePath?.split('/')[0] || 'Upload'}`
-                    : `${stagedFiles.length} file${stagedFiles.length > 1 ? 's' : ''}`;
-            }
+            let batchName = batchNameInput || (uploadMode === 'folder'
+                ? 'Folder: ' + (stagedFiles[0]?.relativePath?.split('/')[0] || 'Upload')
+                : stagedFiles.length + ' file' + (stagedFiles.length > 1 ? 's' : ''));
             formData.append('batch_name', batchName);
 
             try {
-                const response = await fetch('/api/upload-multiple', {
-                    method: 'POST',
-                    body: formData
-                });
+                const response = await fetch('/api/upload-multiple', { method: 'POST', body: formData });
                 const data = await response.json();
 
                 if (response.ok) {
-                    // Show any partial errors
-                    if (data.errors && data.errors.length > 0) {
-                        console.warn('Some uploads had issues:', data.errors);
-                        alert('Some files had issues:\\n' + data.errors.join('\\n'));
-                    }
+                    if (data.errors?.length) alert('Some files had issues:\\n' + data.errors.join('\\n'));
                     pollBatch(data.batch_id);
                     clearStaged();
                     document.getElementById('batchName').value = '';
                 } else {
                     alert('Upload failed: ' + (data.detail || 'Unknown error'));
                 }
-
             } catch (error) {
-                console.error('Upload failed:', error);
                 alert('Upload failed: ' + error.message);
             } finally {
                 startBtn.disabled = false;
@@ -1937,48 +1525,27 @@ HTML_TEMPLATE = """
         async function pollBatch(batchId) {
             const poll = async () => {
                 try {
-                    const response = await fetch(`/api/batch/${batchId}`);
-                    if (!response.ok) {
-                        console.error('Failed to fetch batch:', response.status);
-                        return;
-                    }
+                    const response = await fetch('/api/batch/' + batchId);
+                    if (!response.ok) return;
                     const batch = await response.json();
                     activeBatches[batchId] = batch;
                     renderBatches();
-
                     if (batch.status === 'processing' || batch.status === 'pending') {
                         pollIntervals[batchId] = setTimeout(poll, 1500);
                     }
                 } catch (error) {
-                    console.error('Poll failed:', error);
-                    // Retry after delay on error
                     pollIntervals[batchId] = setTimeout(poll, 3000);
                 }
             };
             poll();
         }
 
-        function getStatusClass(status) {
-            return `status-${status}`;
-        }
-
-        function getDotClass(status) {
-            return `dot-${status}`;
-        }
-
         function renderBatches() {
             const container = document.getElementById('batchesSection');
-
-            const batchList = Object.values(activeBatches).sort((a, b) =>
-                new Date(b.created_at) - new Date(a.created_at)
-            );
+            const batchList = Object.values(activeBatches).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 
             if (batchList.length === 0) {
-                container.innerHTML = `
-                    <div class="text-center text-gray-500 py-8">
-                        No batches yet. Upload some PDFs to get started!
-                    </div>
-                `;
+                container.innerHTML = '<div class="text-center text-gray-500 py-8 bg-white rounded-xl shadow">No batches yet. Upload some PDFs to get started!</div>';
                 return;
             }
 
@@ -1988,171 +1555,60 @@ HTML_TEMPLATE = """
                 const failedJobs = jobs.filter(j => j.status === 'failed').length;
                 const processingJobs = jobs.filter(j => j.status === 'processing').length;
                 const queuedJobs = jobs.filter(j => j.status === 'queued' || j.status === 'pending').length;
-
-                const overallProgress = batch.total_files > 0
-                    ? Math.round((batch.completed_files / batch.total_files) * 100)
-                    : 0;
-
+                const overallProgress = batch.total_files > 0 ? Math.round((batch.completed_files / batch.total_files) * 100) : 0;
                 const canDownloadAll = completedJobs > 0;
 
-                return `
-                <div class="bg-white rounded-xl shadow-lg p-6">
-                    <div class="flex justify-between items-start mb-4">
-                        <div class="flex-1">
-                            <h3 class="text-lg font-semibold text-gray-800">
-                                ${batch.name || 'Batch'}
-                            </h3>
-                            <div class="flex flex-wrap gap-2 mt-1 text-sm">
-                                ${completedJobs > 0 ? `<span class="text-green-600">${completedJobs} completed</span>` : ''}
-                                ${processingJobs > 0 ? `<span class="text-blue-600">${processingJobs} processing</span>` : ''}
-                                ${queuedJobs > 0 ? `<span class="text-gray-500">${queuedJobs} queued</span>` : ''}
-                                ${failedJobs > 0 ? `<span class="text-red-500">${failedJobs} failed</span>` : ''}
-                            </div>
-                            ${batch.output_path ?
-                                `<p class="text-xs text-gray-400 mt-1">
-                                    Output path: ${batch.output_path}</p>` : ''}
-                        </div>
-                        <div class="flex items-center gap-2">
-                            <span class="px-3 py-1 rounded-full text-sm font-medium ${getStatusClass(batch.status)}">
-                                ${batch.status}
-                            </span>
-                            ${canDownloadAll ? `
-                                <button onclick="downloadAllOutputs('${batch.id}')"
-                                        class="px-3 py-1 bg-green-500 text-white rounded-lg
-                                               hover:bg-green-600 text-sm font-medium">
-                                    Download All
-                                </button>
-                            ` : ''}
-                            <button onclick="deleteBatch('${batch.id}')"
-                                    class="text-red-500 hover:text-red-700 text-xl px-2">
-                                &times;
-                            </button>
-                        </div>
-                    </div>
-
-                    <div class="mb-4">
-                        <div class="flex justify-between text-xs text-gray-500 mb-1">
-                            <span>Progress: ${batch.completed_files}/${batch.total_files}</span>
-                            <span>${overallProgress}%</span>
-                        </div>
-                        <div class="bg-gray-200 rounded-full h-2">
-                            <div class="bg-blue-500 rounded-full h-2 transition-all duration-300"
-                                 style="width: ${overallProgress}%"></div>
-                        </div>
-                    </div>
-
-                    <div class="space-y-2 max-h-80 overflow-y-auto">
-                        ${jobs.length === 0 ? `
-                            <div class="text-center text-gray-400 py-4">
-                                Loading jobs...
-                            </div>
-                        ` : jobs.map(job => {
-                            return `
-                            <div class="flex items-center justify-between py-2 px-3
-                                        bg-gray-50 rounded-lg">
-                                <div class="flex-1 min-w-0">
-                                    <div class="flex items-center gap-2">
-                                        <span class="w-2 h-2 rounded-full ${getDotClass(job.status)}"></span>
-                                        <p class="text-sm font-medium text-gray-800 truncate">
-                                            ${job.filename}
-                                        </p>
-                                    </div>
-                                    ${job.relative_path ?
-                                        `<p class="text-xs text-gray-400 truncate ml-4">
-                                            ${job.relative_path}</p>` : ''}
-                                    ${job.status === 'processing' ? `
-                                        <div class="mt-1 ml-4 flex items-center gap-2">
-                                            <div class="flex-1 bg-gray-200 rounded-full h-1.5">
-                                                <div class="bg-blue-500 rounded-full h-1.5 transition-all"
-                                                     style="width: ${job.progress || 0}%">
-                                                </div>
-                                            </div>
-                                            <span class="text-xs text-gray-500 whitespace-nowrap">
-                                                ${job.current_page || 0}/${job.total_pages || '?'} pages
-                                            </span>
-                                        </div>
-                                    ` : ''}
-                                    ${job.status === 'failed' && job.error ? `
-                                        <p class="text-xs text-red-500 ml-4 mt-1">
-                                            Error: ${job.error}
-                                        </p>
-                                    ` : ''}
-                                </div>
-                                <div class="flex items-center gap-2 ml-4">
-                                    ${job.status === 'completed' ? `
-                                        <button onclick="viewOutput('${job.id}')"
-                                                class="px-2 py-1 bg-blue-100 text-blue-700
-                                                       rounded hover:bg-blue-200 text-sm">
-                                            View
-                                        </button>
-                                        <button onclick="downloadJobOutput('${job.id}', '${job.filename.replace(/'/g, "\\'")}')"
-                                                class="px-2 py-1 bg-green-100 text-green-700
-                                                       rounded hover:bg-green-200 text-sm">
-                                            .md
-                                        </button>
-                                    ` : ''}
-                                    <span class="text-xs text-gray-400 capitalize">
-                                        ${job.status}
-                                    </span>
-                                </div>
-                            </div>
-                            `;
-                        }).join('')}
-                    </div>
-                </div>
-                `;
+                return '<div class="bg-white rounded-xl shadow-lg p-6 fade-in"><div class="flex justify-between items-start mb-4"><div class="flex-1"><h3 class="text-lg font-semibold text-gray-800">' + (batch.name || 'Batch') + '</h3><div class="flex flex-wrap gap-2 mt-1 text-sm">' +
+                    (completedJobs > 0 ? '<span class="text-green-600">' + completedJobs + ' completed</span>' : '') +
+                    (processingJobs > 0 ? '<span class="text-blue-600">' + processingJobs + ' processing</span>' : '') +
+                    (queuedJobs > 0 ? '<span class="text-gray-500">' + queuedJobs + ' queued</span>' : '') +
+                    (failedJobs > 0 ? '<span class="text-red-500">' + failedJobs + ' failed</span>' : '') +
+                    '</div></div><div class="flex items-center gap-2"><span class="px-3 py-1 rounded-full text-sm font-medium status-' + batch.status + '">' + batch.status + '</span>' +
+                    (canDownloadAll ? '<button onclick="downloadAllOutputs(\'' + batch.id + '\')" class="px-3 py-1 bg-green-500 text-white rounded-lg hover:bg-green-600 text-sm font-medium">Download All</button>' : '') +
+                    '<button onclick="deleteBatch(\'' + batch.id + '\')" class="text-red-500 hover:text-red-700 text-xl px-2">×</button></div></div>' +
+                    '<div class="mb-4"><div class="flex justify-between text-xs text-gray-500 mb-1"><span>Progress: ' + batch.completed_files + '/' + batch.total_files + '</span><span>' + overallProgress + '%</span></div><div class="bg-gray-200 rounded-full h-2"><div class="bg-gradient-to-r from-blue-500 to-purple-500 rounded-full h-2 transition-all duration-300" style="width: ' + overallProgress + '%"></div></div></div>' +
+                    '<div class="space-y-2 max-h-80 overflow-y-auto">' + (jobs.length === 0 ? '<div class="text-center text-gray-400 py-4">Loading jobs...</div>' : jobs.map(job => {
+                        return '<div class="flex items-center justify-between py-2 px-3 bg-gray-50 rounded-lg"><div class="flex-1 min-w-0"><div class="flex items-center gap-2"><span class="w-2 h-2 rounded-full dot-' + job.status + '"></span><p class="text-sm font-medium text-gray-800 truncate">' + job.filename + '</p></div>' +
+                            (job.relative_path ? '<p class="text-xs text-gray-400 truncate ml-4">' + job.relative_path + '</p>' : '') +
+                            (job.status === 'processing' ? '<div class="mt-1 ml-4 flex items-center gap-2"><div class="flex-1 bg-gray-200 rounded-full h-1.5"><div class="bg-blue-500 rounded-full h-1.5 transition-all" style="width: ' + (job.progress || 0) + '%"></div></div><span class="text-xs text-gray-500 whitespace-nowrap">' + (job.current_page || 0) + '/' + (job.total_pages || '?') + ' pages</span></div>' : '') +
+                            (job.status === 'failed' && job.error ? '<p class="text-xs text-red-500 ml-4 mt-1">Error: ' + job.error + '</p>' : '') +
+                            '</div><div class="flex items-center gap-2 ml-4">' +
+                            (job.status === 'completed' ? '<button onclick="viewOutput(\'' + job.id + '\')" class="px-2 py-1 bg-blue-100 text-blue-700 rounded hover:bg-blue-200 text-sm">View</button><button onclick="downloadJobOutput(\'' + job.id + '\', \'' + job.filename.replace(/'/g, "\\'") + '\')" class="px-2 py-1 bg-green-100 text-green-700 rounded hover:bg-green-200 text-sm">.md</button>' : '') +
+                            '<span class="text-xs text-gray-400 capitalize">' + job.status + '</span></div></div>';
+                    }).join('')) + '</div></div>';
             }).join('');
         }
 
         async function viewOutput(jobId) {
             try {
-                const response = await fetch(`/api/jobs/${jobId}/output`);
-                if (!response.ok) {
-                    const err = await response.json();
-                    alert('Failed to load output: ' + (err.detail || 'Unknown error'));
-                    return;
-                }
+                const response = await fetch('/api/jobs/' + jobId + '/output');
+                if (!response.ok) { alert('Failed to load output'); return; }
                 const data = await response.json();
-
                 currentOutput = data.text;
-                currentFilename = data.filename
-                    .replace('.pdf', '.md')
-                    .replace('.PDF', '.md');
-
+                currentFilename = data.filename.replace(/\\.pdf$/i, '.md');
                 document.getElementById('outputSection').classList.remove('hidden');
                 document.getElementById('outputTitle').textContent = data.filename;
-                document.getElementById('renderedOutput').innerHTML =
-                    marked.parse(data.text);
-                document.getElementById('rawOutput').querySelector('pre')
-                    .textContent = data.text;
-
-                document.getElementById('outputSection')
-                    .scrollIntoView({ behavior: 'smooth' });
+                document.getElementById('renderedOutput').innerHTML = marked.parse(data.text);
+                document.getElementById('rawOutput').querySelector('pre').textContent = data.text;
+                document.getElementById('outputSection').scrollIntoView({ behavior: 'smooth' });
             } catch (error) {
-                console.error('Failed to load output:', error);
                 alert('Failed to load output: ' + error.message);
             }
         }
 
         async function downloadJobOutput(jobId, filename) {
             try {
-                const response = await fetch(`/api/jobs/${jobId}/output`);
-                if (!response.ok) {
-                    alert('Failed to download');
-                    return;
-                }
+                const response = await fetch('/api/jobs/' + jobId + '/output');
+                if (!response.ok) { alert('Failed to download'); return; }
                 const data = await response.json();
-
-                const mdFilename = filename.replace(/\\.pdf$/i, '.md');
                 const blob = new Blob([data.text], { type: 'text/markdown' });
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.href = url;
-                a.download = mdFilename;
+                a.download = filename.replace(/\\.pdf$/i, '.md');
                 a.click();
                 URL.revokeObjectURL(url);
             } catch (error) {
-                console.error('Download failed:', error);
                 alert('Download failed');
             }
         }
@@ -2160,60 +1616,37 @@ HTML_TEMPLATE = """
         async function downloadAllOutputs(batchId) {
             const batch = activeBatches[batchId];
             if (!batch || !batch.jobs) return;
-
             const completedJobs = batch.jobs.filter(j => j.status === 'completed');
-            if (completedJobs.length === 0) {
-                alert('No completed jobs to download');
-                return;
-            }
+            if (completedJobs.length === 0) { alert('No completed jobs to download'); return; }
+            if (completedJobs.length === 1) { await downloadJobOutput(completedJobs[0].id, completedJobs[0].filename); return; }
 
-            // If only one file, download directly
-            if (completedJobs.length === 1) {
-                const job = completedJobs[0];
-                await downloadJobOutput(job.id, job.filename);
-                return;
-            }
-
-            // Multiple files - create a zip
             try {
                 const zip = new JSZip();
-
                 for (const job of completedJobs) {
-                    const response = await fetch(`/api/jobs/${job.id}/output`);
+                    const response = await fetch('/api/jobs/' + job.id + '/output');
                     if (!response.ok) continue;
                     const data = await response.json();
-
                     let filepath = job.filename.replace(/\\.pdf$/i, '.md');
-                    if (job.relative_path) {
-                        filepath = job.relative_path.replace(/\\.pdf$/i, '.md');
-                    }
-
+                    if (job.relative_path) filepath = job.relative_path.replace(/\\.pdf$/i, '.md');
                     zip.file(filepath, data.text);
                 }
-
                 const content = await zip.generateAsync({ type: 'blob' });
                 const url = URL.createObjectURL(content);
                 const a = document.createElement('a');
                 a.href = url;
-                a.download = `${batch.name || 'batch'}.zip`;
+                a.download = (batch.name || 'batch') + '.zip';
                 a.click();
                 URL.revokeObjectURL(url);
             } catch (error) {
-                console.error('Zip creation failed:', error);
                 alert('Failed to create zip file');
             }
         }
 
         async function deleteBatch(batchId) {
             if (!confirm('Delete this batch and all its jobs?')) return;
-
-            if (pollIntervals[batchId]) {
-                clearTimeout(pollIntervals[batchId]);
-                delete pollIntervals[batchId];
-            }
-
+            if (pollIntervals[batchId]) { clearTimeout(pollIntervals[batchId]); delete pollIntervals[batchId]; }
             try {
-                await fetch(`/api/batch/${batchId}`, { method: 'DELETE' });
+                await fetch('/api/batch/' + batchId, { method: 'DELETE' });
                 delete activeBatches[batchId];
                 renderBatches();
             } catch (error) {
@@ -2226,29 +1659,18 @@ HTML_TEMPLATE = """
             const raw = document.getElementById('rawOutput');
             const tabRendered = document.getElementById('tabRendered');
             const tabRaw = document.getElementById('tabRaw');
-
             if (tab === 'rendered') {
-                rendered.classList.remove('hidden');
-                raw.classList.add('hidden');
-                tabRendered.classList.add('border-b-2', 'border-blue-500',
-                                          'text-blue-600');
-                tabRaw.classList.remove('border-b-2', 'border-blue-500',
-                                        'text-blue-600');
+                rendered.classList.remove('hidden'); raw.classList.add('hidden');
+                tabRendered.classList.add('border-b-2', 'border-blue-500', 'text-blue-600');
+                tabRaw.classList.remove('border-b-2', 'border-blue-500', 'text-blue-600');
             } else {
-                rendered.classList.add('hidden');
-                raw.classList.remove('hidden');
-                tabRaw.classList.add('border-b-2', 'border-blue-500',
-                                     'text-blue-600');
-                tabRendered.classList.remove('border-b-2', 'border-blue-500',
-                                             'text-blue-600');
+                rendered.classList.add('hidden'); raw.classList.remove('hidden');
+                tabRaw.classList.add('border-b-2', 'border-blue-500', 'text-blue-600');
+                tabRendered.classList.remove('border-b-2', 'border-blue-500', 'text-blue-600');
             }
         }
 
-        function copyOutput() {
-            navigator.clipboard.writeText(currentOutput);
-            alert('Copied to clipboard!');
-        }
-
+        function copyOutput() { navigator.clipboard.writeText(currentOutput); alert('Copied to clipboard!'); }
         function downloadOutput() {
             const blob = new Blob([currentOutput], { type: 'text/markdown' });
             const url = URL.createObjectURL(blob);
@@ -2262,21 +1684,14 @@ HTML_TEMPLATE = """
         async function loadExistingBatches() {
             try {
                 const response = await fetch('/api/batches');
-                if (!response.ok) {
-                    console.error('Failed to load batches');
-                    return;
-                }
+                if (!response.ok) return;
                 const batches = await response.json();
-
                 for (const batch of batches) {
                     if (batch.status === 'processing' || batch.status === 'pending') {
                         pollBatch(batch.id);
                     } else {
-                        // Load full batch with jobs
-                        const fullResponse = await fetch(`/api/batch/${batch.id}`);
-                        if (fullResponse.ok) {
-                            activeBatches[batch.id] = await fullResponse.json();
-                        }
+                        const fullResponse = await fetch('/api/batch/' + batch.id);
+                        if (fullResponse.ok) activeBatches[batch.id] = await fullResponse.json();
                     }
                 }
                 renderBatches();
@@ -2285,12 +1700,7 @@ HTML_TEMPLATE = """
             }
         }
 
-        // Initialize
-        async function init() {
-            await checkConfiguration();
-            loadExistingBatches();
-        }
-        init();
+        loadExistingBatches();
     </script>
 </body>
 </html>
@@ -2309,18 +1719,34 @@ async def home():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    print("\n" + "=" * 50)
-    print("olmOCR Batch Processor v2.0")
-    print("=" * 50)
-    print("\nFeatures:")
-    print(f"  - Parallel processing ({MAX_CONCURRENT_PAGES} pages concurrent)")
-    print("  - Persistent jobs via Firestore")
-    print("  - Folder uploads with structure preservation")
-    print("  - Configurable output locations")
-    print(f"\nGCP Project: {GCP_PROJECT_ID or 'auto-detect'}")
-    if GCS_BUCKET:
-        print(f"GCS Bucket: {GCS_BUCKET}")
-    print(f"\nOpen http://localhost:{port} in your browser")
-    print("\nPress Ctrl+C to stop\n")
+
+    print("\n" + "=" * 60)
+    print("  olmOCR Batch Processor v3.0")
+    print("=" * 60)
+    print("\n  FEATURES:")
+    print(f"    - Parallel processing ({MAX_CONCURRENT_PAGES} pages concurrent)")
+    print("    - Persistent jobs (survive browser close)")
+    print("    - Folder uploads with structure preservation")
+    print("    - Beautiful web interface")
+
+    print("\n  STORAGE MODE:", end=" ")
+    if STORAGE_MODE == "cloud" or GCP_PROJECT_ID:
+        print("Cloud (Firestore + GCS)")
+    else:
+        print(f"Local (SQLite + filesystem)")
+        print(f"    - Database: {DB_PATH}")
+        print(f"    - PDFs: {PDF_DIR}")
+        print(f"    - Outputs: {OUTPUT_DIR}")
+
+    print("\n  API KEY:", "Configured" if PARASAIL_API_KEY else "NOT SET")
+
+    if not PARASAIL_API_KEY:
+        print("\n  ⚠️  WARNING: PARASAIL_API_KEY not set!")
+        print("     Get a key from https://parasail.io")
+        print("     Then run: export PARASAIL_API_KEY='your-key'")
+
+    print(f"\n  Open http://localhost:{port} in your browser")
+    print("\n  Press Ctrl+C to stop\n")
+    print("=" * 60 + "\n")
 
     uvicorn.run(app, host="0.0.0.0", port=port)
