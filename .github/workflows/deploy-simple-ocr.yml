@@ -28,9 +28,37 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
+      - name: Setup Firestore
+        run: |
+          # Enable Firestore API if not already enabled
+          gcloud services enable firestore.googleapis.com --quiet || true
+          # Create Firestore database if it doesn't exist
+          gcloud firestore databases describe --database="(default)" 2>/dev/null || \
+            gcloud firestore databases create --location=$REGION --quiet || true
+
+      - name: Setup Cloud Storage
+        run: |
+          # Enable Storage API
+          gcloud services enable storage.googleapis.com --quiet || true
+          # Create bucket if it doesn't exist
+          BUCKET_NAME="${PROJECT_ID}-olmocr-pdfs"
+          gcloud storage buckets describe "gs://${BUCKET_NAME}" 2>/dev/null || \
+            gcloud storage buckets create "gs://${BUCKET_NAME}" --location=$REGION --uniform-bucket-level-access --quiet || true
+          echo "GCS_BUCKET=${BUCKET_NAME}" >> $GITHUB_ENV
+
       - name: Deploy to Cloud Run
         run: |
           cd simple-ocr-app
+
+          # Build environment variables string
+          # API key is now optional - users configure via web UI
+          ENV_VARS="GCP_PROJECT_ID=${{ secrets.GCP_PROJECT_ID }},GCS_BUCKET=${GCS_BUCKET}"
+
+          # Add API key if provided (for backwards compatibility)
+          if [ -n "${{ secrets.PARASAIL_API_KEY }}" ]; then
+            ENV_VARS="${ENV_VARS},PARASAIL_API_KEY=${{ secrets.PARASAIL_API_KEY }}"
+          fi
+
           gcloud run deploy $SERVICE_NAME \
             --source . \
             --platform managed \
@@ -39,9 +67,20 @@ jobs:
             --memory 2Gi \
             --cpu 2 \
             --timeout 600 \
-            --set-env-vars "PARASAIL_API_KEY=${{ secrets.PARASAIL_API_KEY }}"
+            --set-env-vars "${ENV_VARS}"
 
       - name: Show URL
         run: |
-          echo "Deployed to:"
-          gcloud run services describe $SERVICE_NAME --region $REGION --format 'value(status.url)'
+          URL=$(gcloud run services describe $SERVICE_NAME --region $REGION --format 'value(status.url)')
+          echo "============================================"
+          echo "Deployment Complete!"
+          echo "============================================"
+          echo ""
+          echo "Your app is live at: $URL"
+          echo ""
+          echo "Next steps:"
+          echo "  1. Open the URL in your browser"
+          echo "  2. Enter your Parasail API key in the setup wizard"
+          echo "  3. Start processing PDFs!"
+          echo ""
+          echo "Get your API key at: https://parasail.io"

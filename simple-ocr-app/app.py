@@ -72,6 +72,12 @@ STORAGE_MODE = os.environ.get("STORAGE_MODE", "local")
 GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "")
 GCS_BUCKET = os.environ.get("GCS_BUCKET", "")
 
+# Firestore collection names
+BATCHES_COLLECTION = "ocr_batches"
+JOBS_COLLECTION = "ocr_jobs"
+PAGES_COLLECTION = "ocr_pages"
+SETTINGS_COLLECTION = "ocr_settings"
+SETTINGS_DOC_ID = "app_config"
 # Local storage paths
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
 DB_PATH = DATA_DIR / "olmocr.db"
@@ -103,6 +109,85 @@ class StorageBackend:
     async def save_job(self, job: dict):
         raise NotImplementedError
 
+# ============================================
+# Settings Management (Web-configurable)
+# ============================================
+
+# Cache for settings to avoid repeated Firestore reads
+_settings_cache: Dict[str, any] = {}
+_settings_cache_time: Optional[datetime] = None
+SETTINGS_CACHE_TTL = 300  # 5 minutes
+
+
+async def get_settings() -> Dict:
+    """Get application settings from Firestore."""
+    global _settings_cache, _settings_cache_time
+
+    # Check cache
+    if _settings_cache and _settings_cache_time:
+        age = (datetime.now() - _settings_cache_time).total_seconds()
+        if age < SETTINGS_CACHE_TTL:
+            return _settings_cache
+
+    try:
+        fs = get_firestore()
+        doc = await fs.collection(SETTINGS_COLLECTION).document(SETTINGS_DOC_ID).get()
+        if doc.exists:
+            _settings_cache = doc.to_dict()
+            _settings_cache_time = datetime.now()
+            return _settings_cache
+    except Exception as e:
+        print(f"Error reading settings: {e}")
+
+    return {}
+
+
+async def save_settings(settings: Dict) -> bool:
+    """Save application settings to Firestore."""
+    global _settings_cache, _settings_cache_time
+
+    try:
+        fs = get_firestore()
+        settings['updated_at'] = datetime.now().isoformat()
+        await fs.collection(SETTINGS_COLLECTION).document(SETTINGS_DOC_ID).set(settings, merge=True)
+
+        # Update cache
+        _settings_cache = {**_settings_cache, **settings}
+        _settings_cache_time = datetime.now()
+        return True
+    except Exception as e:
+        print(f"Error saving settings: {e}")
+        return False
+
+
+async def get_api_key() -> str:
+    """Get Parasail API key - checks Firestore first, falls back to env var."""
+    settings = await get_settings()
+    api_key = settings.get('parasail_api_key', '')
+
+    # Fall back to environment variable if not in Firestore
+    if not api_key:
+        api_key = PARASAIL_API_KEY
+
+    return api_key
+
+
+async def is_configured() -> bool:
+    """Check if the app has been configured with an API key."""
+    api_key = await get_api_key()
+    return bool(api_key and len(api_key) > 10)
+
+
+def clear_settings_cache():
+    """Clear the settings cache to force a refresh."""
+    global _settings_cache, _settings_cache_time
+    _settings_cache = {}
+    _settings_cache_time = None
+
+
+# ============================================
+# App Setup
+# ============================================
     async def get_job(self, job_id: str) -> Optional[dict]:
         raise NotImplementedError
 
@@ -515,7 +600,8 @@ async def process_single_page(
     session: aiohttp.ClientSession,
     image_base64: str,
     page_num: int,
-    semaphore: asyncio.Semaphore
+    semaphore: asyncio.Semaphore,
+    api_key: str
 ) -> dict:
     """Process a single page via Parasail API."""
 
@@ -541,7 +627,7 @@ async def process_single_page(
         }
 
         headers = {
-            "Authorization": f"Bearer {PARASAIL_API_KEY}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
 
@@ -598,6 +684,11 @@ async def process_job(job_id: str):
             if not job:
                 return
 
+            # Get API key dynamically from settings
+            api_key = await get_api_key()
+            if not api_key:
+                raise Exception("No API key configured. Please set up your Parasail API key in Settings.")
+
             job['status'] = 'processing'
             job['started_at'] = datetime.now().isoformat()
             await storage.save_job(job)
@@ -628,7 +719,7 @@ async def process_job(job_id: str):
 
             async with aiohttp.ClientSession() as session:
                 tasks = [
-                    process_single_page(session, img_b64, page_num, page_semaphore)
+                    process_single_page(session, img_b64, page_num, page_semaphore, api_key)
                     for page_num, img_b64 in enumerate(base64_images)
                 ]
 
@@ -1198,6 +1289,7 @@ HTML_TEMPLATE = """
                 </div>
             </div>
         </div>
+        </div> <!-- End mainContent -->
     </div>
 
     <script>
