@@ -1,0 +1,7 @@
+{
+  "projects": {
+    "default": "juniper-core"
+  },
+  "targets": {},
+  "etags": {}
+}
