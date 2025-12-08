@@ -95,3 +95,9 @@ site/
 # App data (generated at runtime)
 simple-ocr-app/data/
 simple-ocr-app/.env
+
+# Firebase artifacts
+.firebase/
+
+# Simple OCR app virtual environment
+simple-ocr-app/venv/
