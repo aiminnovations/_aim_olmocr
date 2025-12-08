@@ -167,6 +167,7 @@ for role in "${BACKEND_ROLES[@]}"; do
     gcloud projects add-iam-policy-binding $PROJECT_ID \
         --member="serviceAccount:olmocr-backend@$PROJECT_ID.iam.gserviceaccount.com" \
         --role="$role" \
+        --condition=None \
         --quiet
 done
 
@@ -182,6 +183,7 @@ for role in "${WORKER_ROLES[@]}"; do
     gcloud projects add-iam-policy-binding $PROJECT_ID \
         --member="serviceAccount:olmocr-worker@$PROJECT_ID.iam.gserviceaccount.com" \
         --role="$role" \
+        --condition=None \
         --quiet
 done
 

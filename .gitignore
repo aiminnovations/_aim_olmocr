@@ -101,3 +101,5 @@ simple-ocr-app/.env
 
 # Simple OCR app virtual environment
 simple-ocr-app/venv/
+simple-ocr-app/env/
+
